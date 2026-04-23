@@ -3,6 +3,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import pandas as pd
 import functools
+import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from shiny import reactive, render
 from shiny.express import input, ui
@@ -10,11 +11,120 @@ from statsbombpy import sb
 from mplsoccer import Pitch
 import shinyswatch
 
-# Configuración de página con tema Litera
+# Configuración de página
 ui.page_opts(
-    title="StatsBomb: Análisis de Recuperaciones en Contraataque", 
+    title="Soccer Intelligence: Recuperaciones", 
     fillable=True,
     theme=shinyswatch.theme.litera
+)
+
+ui.head_content(
+    ui.tags.link(rel="preconnect", href="https://fonts.googleapis.com"),
+    ui.tags.link(rel="preconnect", href="https://fonts.gstatic.com", crossorigin="anonymous"),
+    ui.tags.link(href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Raleway:wght@700;800&display=swap", rel="stylesheet"),
+    ui.tags.style("""
+        :root {
+          --bg: #f8fafc;
+          --surface: #ffffff;
+          --border: #e2e8f0;
+          --text: #0f172a;
+          --muted: #64748b;
+          --primary: #1e40af;
+          --shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+          --radius: 12px;
+        }
+
+        body {
+          background: var(--bg);
+          color: var(--text);
+          font-family: 'Inter', sans-serif;
+        }
+
+        h1, h2, h3, h4, .card-header {
+          font-family: 'Raleway', sans-serif;
+          letter-spacing: -0.01em;
+        }
+
+        .card {
+          border: 1px solid var(--border) !important;
+          border-radius: var(--radius) !important;
+          box-shadow: var(--shadow) !important;
+          margin-bottom: 1.5rem;
+        }
+
+        .card-header {
+          background-color: transparent !important;
+          border-bottom: 1px solid var(--border) !important;
+          font-weight: 600 !important;
+          color: var(--text) !important;
+          padding: 1rem 1.25rem !important;
+        }
+
+        .sidebar {
+          border-right: 1px solid var(--border) !important;
+          padding: 1.5rem !important;
+        }
+
+        .section-title {
+          font-size: 1.1rem;
+          font-weight: 600;
+          margin-bottom: 1.25rem;
+          color: var(--text);
+        }
+
+        .btn-primary {
+          background: var(--primary) !important;
+          border-color: var(--primary) !important;
+          border-radius: 8px !important;
+          font-weight: 600;
+          padding: 0.6rem 1rem;
+          transition: all 0.2s;
+        }
+
+        .btn-primary:hover {
+          transform: translateY(-1px);
+          box-shadow: 0 4px 12px rgba(30, 64, 175, 0.25);
+        }
+
+        .nav-underline .nav-link.active {
+          color: var(--primary) !important;
+          font-weight: 600;
+        }
+
+        .kpi-card {
+          text-align: center;
+          padding: 1.5rem !important;
+        }
+
+        .kpi-value {
+          font-size: 2.25rem;
+          font-weight: 800;
+          line-height: 1;
+          margin-bottom: 0.5rem;
+          letter-spacing: -0.02em;
+        }
+
+        .kpi-label {
+          font-size: 0.875rem;
+          font-weight: 500;
+          color: var(--muted);
+          text-transform: uppercase;
+          letter-spacing: 0.025em;
+        }
+
+        .control-label {
+          font-size: 0.8rem !important;
+          font-weight: 600 !important;
+          color: var(--muted) !important;
+          margin-bottom: 0.4rem !important;
+        }
+
+        /* Custom scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    """)
 )
 
 # ─────────────────────────────────────────────
@@ -73,64 +183,71 @@ def get_competitions():
 # UI SIDEBAR
 # ─────────────────────────────────────────────
 
-with ui.sidebar(width=350, bg="#f8f9fa"):
-    ui.h4("Configuración", style="color: #2c3e50; font-weight: bold;")
-    ui.hr()
-    
-    @render.ui
-    def competition_selector():
-        comps = get_competitions()
-        choices = {"all": "--- TODAS ---"}
-        choices.update({str(row['competition_id']): f"{row['competition_name']} ({row['country_name']})" 
-                   for _, row in comps.iterrows()})
-        return ui.input_selectize("competition_ids", "Competiciones", choices, multiple=True)
-
-    @render.ui
-    def season_selector():
-        if not input.competition_ids():
-            return ui.input_selectize("season_ids", "Temporadas", {}, multiple=True)
-        
-        comps = get_competitions()
-        selected_comps_raw = input.competition_ids()
-        
-        if "all" in selected_comps_raw:
-            relevant_seasons = comps
-        else:
-            selected_comps = [int(cid) for cid in selected_comps_raw]
-            relevant_seasons = comps[comps['competition_id'].isin(selected_comps)]
-            
-        choices = {"all": "--- TODAS ---"}
-        choices.update({str(row['season_id']): row['season_name'] for _, row in relevant_seasons.iterrows()})
-        return ui.input_selectize("season_ids", "Temporadas", choices, multiple=True)
-
-    @render.ui
-    def team_selector():
-        matches = get_matches()
-        if matches is None or matches.empty:
-            return ui.input_selectize("team_names", "Equipos", {}, multiple=True)
-        
-        teams = sorted(list(set(matches['home_team'].tolist() + matches['away_team'].tolist())))
-        choices = {"all": "--- TODOS LOS EQUIPOS ---"}
-        choices.update({t: t for t in teams})
-        return ui.input_selectize("team_names", "Equipos", choices, multiple=True)
-
-    ui.input_selectize(
-        "play_patterns", "Patrones de Juego",
-        choices={
-            "Regular Play": "Juego Regular",
-            "From Counter": "Contraataque",
-            "From Keeper": "Desde Portero",
-            "From Corner": "Córner",
-            "From Free Kick": "Falta",
-            "From Throw In": "Saque de Banda",
-            "From Goal Kick": "Saque de Puerta",
-            "From Kick Off": "Saque de Centro"
-        },
-        selected=["From Counter"],
-        multiple=True
+with ui.sidebar(width=300, bg="white"):
+    ui.div(
+        ui.h2("Soccer Intelligence", style="font-size: 1.4rem; font-weight: 800; color: #1e40af; margin-bottom: 0.25rem;"),
+        ui.p("Análisis de recuperaciones", style="font-size: 0.85rem; color: #64748b; margin-bottom: 1.5rem;"),
+        class_="sidebar-header"
     )
-    ui.input_switch("use_360", "Enriquecer con datos 360", False)
-    ui.input_action_button("analyze", "Analizar Datos", class_="btn-primary w-100", style="margin-top: 10px;")
+    
+    with ui.div(class_="filter-container"):
+        @render.ui
+        def competition_selector():
+            comps = get_competitions()
+            choices = {"all": "Todas las competiciones"}
+            choices.update({str(row['competition_id']): f"{row['competition_name']}" 
+                       for _, row in comps.iterrows()})
+            return ui.input_selectize("competition_ids", "Competiciones", choices, multiple=True)
+
+        @render.ui
+        def season_selector():
+            if not input.competition_ids():
+                return ui.input_selectize("season_ids", "Temporadas", {}, multiple=True)
+            
+            comps = get_competitions()
+            selected_comps_raw = input.competition_ids()
+            
+            if "all" in selected_comps_raw:
+                relevant_seasons = comps
+            else:
+                selected_comps = [int(cid) for cid in selected_comps_raw]
+                relevant_seasons = comps[comps['competition_id'].isin(selected_comps)]
+                
+            choices = {"all": "Todas las temporadas"}
+            choices.update({str(row['season_id']): row['season_name'] for _, row in relevant_seasons.iterrows()})
+            return ui.input_selectize("season_ids", "Temporadas", choices, multiple=True)
+
+        @render.ui
+        def team_selector():
+            matches = get_matches()
+            if matches is None or matches.empty:
+                return ui.input_selectize("team_names", "Equipos", {}, multiple=True)
+            
+            teams = sorted(list(set(matches['home_team'].tolist() + matches['away_team'].tolist())))
+            choices = {"all": "Todos los equipos"}
+            choices.update({t: t for t in teams})
+            return ui.input_selectize("team_names", "Equipos", choices, multiple=True)
+
+        ui.input_selectize(
+            "play_patterns", "Patrones de Juego",
+            choices={
+                "Regular Play": "Juego Regular",
+                "From Counter": "Contraataque",
+                "From Keeper": "Desde Portero",
+                "From Corner": "Córner",
+                "From Free Kick": "Falta",
+                "From Throw In": "Saque de Banda",
+                "From Goal Kick": "Saque de Puerta",
+                "From Kick Off": "Saque de Centro"
+            },
+            selected=["From Counter"],
+            multiple=True
+        )
+        
+        ui.input_switch("use_360", "Datos 360 enriquecidos", False)
+        
+    ui.div(style="height: 20px;")
+    ui.input_action_button("analyze", "Actualizar análisis", class_="btn-primary w-100")
 
 # ─────────────────────────────────────────────
 # LÓGICA DE DATOS
@@ -172,7 +289,7 @@ def get_matches():
 
 @reactive.calc
 @reactive.event(input.analyze)
-def process_data():
+async def process_data():
     matches = get_matches()
     if matches is None or not input.team_names():
         return None
@@ -193,21 +310,22 @@ def process_data():
         return None
     
     team_set = frozenset(team_list)
-    pattern_set = frozenset(input.play_patterns())
+    pattern_set = frozenset(input.play_patterns() or [])
     match_ids = relevant_matches['match_id'].tolist()
     all_recoveries = []
     
     with ui.Progress(min=0, max=len(match_ids)) as p:
         p.set(message=f"Procesando {len(match_ids)} partidos en paralelo...")
         
+        loop = asyncio.get_running_loop()
         with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {
-                executor.submit(_process_single_match, mid, team_set, pattern_set): mid
+            tasks = [
+                loop.run_in_executor(executor, _process_single_match, mid, team_set, pattern_set)
                 for mid in match_ids
-            }
-            for i, future in enumerate(as_completed(futures)):
+            ]
+            for i, task in enumerate(asyncio.as_completed(tasks)):
+                result = await task
                 p.set(i + 1, detail=f"Completados: {i + 1} / {len(match_ids)}")
-                result = future.result()
                 if result is not None:
                     all_recoveries.append(result)
 
@@ -217,8 +335,8 @@ def process_data():
 
 
 @reactive.calc
-def get_heatmap_stats():
-    data = process_data()
+async def get_heatmap_stats():
+    data = await process_data()
     if data is None or data.empty:
         return None
     
@@ -249,182 +367,122 @@ def get_heatmap_stats():
 # ÁREA PRINCIPAL
 # ─────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# HELPER: Figura compatible con Shiny (usa GridSpec)
-# ─────────────────────────────────────────────
-
-def _make_pitch_figure(figheight=8):
+def _make_custom_grid(figheight=8):
     """
-    Crea una figura con GridSpec para que TODOS los ejes tengan SubplotSpec válido.
-    Shiny requiere esto para poder mapear coordenadas de la figura.
-    
-    Layout (columnas, proporción ancho):
-      col 0: campo (ancho 20) | col 1: colorbar (ancho 1)
-    Layout (filas, proporción alto):
-      fila 0: título (alto 1) | fila 1: campo (alto 14) | fila 2: nota (alto 1)
-    
-    Para ajustar el layout manualmente:
-      - figheight: alto total en pulgadas
-      - width_ratios: [ancho_campo, ancho_colorbar]
-      - height_ratios: [alto_titulo, alto_campo, alto_nota]
+    Crea una figura con GridSpec para que TODOS los ejes sean SubplotSpec válidos.
+    Esto evita el error 'NoneType object has no attribute rowspan' en Shiny.
     """
     from matplotlib.gridspec import GridSpec
-
-    # ── Parámetros de layout (modifica aquí) ──────────────────────
-    width_ratios  = [20, 1]   # campo vs colorbar
-    height_ratios = [1, 14, 1] # titulo, campo, nota
-    fig_aspect    = 68 / 105   # proporción del campo StatsBomb
-    # ──────────────────────────────────────────────────────────────
-
-    field_w = (figheight * sum(height_ratios) / height_ratios[1]) * (width_ratios[0] / sum(width_ratios))
-    figwidth = figheight / fig_aspect * (width_ratios[0] / (width_ratios[0]))  # estimación
-    figwidth = figheight * 1.85  # relación campo ancho/alto + espacio colorbar
-
-    fig = plt.figure(figsize=(figwidth, figheight), facecolor='#1a2732')
-    gs = GridSpec(
-        3, 2, figure=fig,
-        height_ratios=height_ratios,
-        width_ratios=width_ratios,
-        hspace=0.05, wspace=0.02,
-        left=0.01, right=0.99, top=0.97, bottom=0.04
-    )
-
-    ax_title   = fig.add_subplot(gs[0, 0])   # fila 0, col 0
-    ax_pitch   = fig.add_subplot(gs[1, 0])   # fila 1, col 0 — CAMPO PRINCIPAL
-    ax_cbar    = fig.add_subplot(gs[1, 1])   # fila 1, col 1 — COLORBAR
-    ax_endnote = fig.add_subplot(gs[2, 0])   # fila 2, col 0
-
-    # Limpiar ejes auxiliares
-    for ax in [ax_title, ax_endnote]:
-        ax.axis('off')
-        ax.set_facecolor('#1a2732')
-
-    ax_cbar.set_facecolor('#1a2732')
-    ax_pitch.set_facecolor('#22312b')
-
-    return fig, ax_pitch, ax_cbar, ax_title, ax_endnote
+    figwidth = figheight * 1.6
+    fig = plt.figure(figsize=(figwidth, figheight), facecolor='white')
+    gs = GridSpec(3, 2, figure=fig, 
+                  height_ratios=[1, 15, 1], 
+                  width_ratios=[40, 1],
+                  left=0.05, right=0.95, top=0.95, bottom=0.05,
+                  wspace=0.02, hspace=0.05)
+    
+    axs = {
+        'title': fig.add_subplot(gs[0, 0]),
+        'pitch': fig.add_subplot(gs[1, 0]),
+        'cbar': fig.add_subplot(gs[1, 1]),
+        'endnote': fig.add_subplot(gs[2, 0])
+    }
+    for k in ['title', 'endnote']:
+        axs[k].axis('off')
+    return fig, axs
 
 
 # ─────────────────────────────────────────────
-# 1. SECCIÓN SUPERIOR: Campo
 # ─────────────────────────────────────────────
-with ui.navset_tab(id="tabs"):
-    with ui.nav_panel("Campo 1: Volumen"):
-        with ui.card(height="850px"):
-            ui.card_header("SECCIÓN CAMPO — Volumen de Recuperaciones y Tiros", style="font-weight: bold;")
+# SECCIÓN DE VISUALIZACIÓN
+# ─────────────────────────────────────────────
+with ui.navset_underline(id="tabs"):
+    with ui.nav_panel("Volumen de recuperaciones"):
+        with ui.card(height="850px", full_screen=True):
+            ui.card_header("Mapa de densidad: Volumen de recuperaciones y tiros")
             @render.plot
-            def field_volumen():
-                stats = get_heatmap_stats()
-
-                # figheight controla el alto total en pulgadas
-                fig, ax, ax_cbar, ax_title, ax_endnote = _make_pitch_figure(figheight=8)
-
-                pitch = Pitch(pitch_type='statsbomb', pitch_color='#22312b',
-                              line_color='#c7d5cc', goal_type='box')
-                pitch.draw(ax=ax)
+            async def field_volumen():
+                stats = await get_heatmap_stats()
+                fig, axs = _make_custom_grid(figheight=8)
+                pitch = Pitch(pitch_type='statsbomb', line_color='black', pitch_color='white', line_zorder=2)
+                pitch.draw(ax=axs['pitch'])
 
                 if stats is None:
-                    ax.text(60, 40, "Sin datos analizados", color='white', ha='center', fontsize=13)
+                    axs['pitch'].text(60, 40, "Esperando análisis...", color='#94a3b8', ha='center', fontsize=14)
                     return fig
 
-                pcm = pitch.heatmap(stats['rec'], ax=ax, cmap='Blues',
-                                    edgecolors='#22312b', lw=0.6, alpha=0.85)
-
-                cx = stats['rec']['cx'].flatten()
-                cy = stats['rec']['cy'].flatten()
-                recs = stats['rec']['statistic'].flatten()
-                shots = stats['shot']['statistic'].flatten()
+                pcm = pitch.heatmap(stats['rec'], ax=axs['pitch'], cmap='Reds', edgecolor='black', linewidth=0.5, alpha=0.7)
+                cx, cy = stats['rec']['cx'].flatten(), stats['rec']['cy'].flatten()
+                recs, shots = stats['rec']['statistic'].flatten(), stats['shot']['statistic'].flatten()
 
                 for i in range(len(cx)):
                     if recs[i] > 0:
                         pitch.text(cx[i], cy[i], f"R:{int(recs[i])}\nT:{int(shots[i])}",
-                                   ax=ax, color='white', fontsize=8.5,
-                                   ha='center', va='center', fontweight='bold')
+                                   ax=axs['pitch'], color='black', fontsize=8, ha='center', va='center', fontweight='bold')
 
-                cb = fig.colorbar(pcm, cax=ax_cbar)
-                cb.ax.tick_params(colors='white', labelsize=9)
-                cb.set_label('Nº Recuperaciones', color='white', size=10)
+                cb = plt.colorbar(pcm, cax=axs['cbar'])
+                cb.ax.tick_params(labelsize=8)
+                cb.set_label('Intensidad de recuperaciones', size=9)
 
-                ax_title.text(0.5, 0.4, "Volumen de Recuperaciones (R) y Tiros generados (T)",
-                              color='white', ha='center', va='center', fontsize=13, fontweight='bold',
-                              transform=ax_title.transAxes)
-
-                ax_endnote.text(0.5, 0.6, "▶  DIRECCIÓN DE ATAQUE  (portería rival →)",
-                                color='#c7d5cc', ha='center', va='center', fontsize=10, fontstyle='italic',
-                                transform=ax_endnote.transAxes)
+                axs['title'].text(0, 0.7, "Volumen de Recuperaciones (R) y Tiros (T)", fontsize=18, fontweight='800', color='#0f172a')
+                axs['title'].text(0, 0.2, "Distribución espacial de recuperaciones de balón y su finalización en tiro", fontsize=11, color='#64748b')
+                axs['endnote'].text(1, 0.5, "Dirección de ataque ➜", ha='right', va='center', fontsize=10, fontstyle='italic', color='#64748b')
                 return fig
 
-    with ui.nav_panel("Campo 2: Eficacia y Goles"):
-        with ui.card(height="850px"):
-            ui.card_header("SECCIÓN CAMPO — Eficacia de Recuperaciones y Goles", style="font-weight: bold;")
+    with ui.nav_panel("Eficacia y goles"):
+        with ui.card(height="850px", full_screen=True):
+            ui.card_header("Mapa de eficacia: Probabilidad de éxito tras recuperación")
             @render.plot
-            def field_eficacia():
-                stats = get_heatmap_stats()
-
-                fig, ax, ax_cbar, ax_title, ax_endnote = _make_pitch_figure(figheight=8)
-
-                pitch = Pitch(pitch_type='statsbomb', pitch_color='#22312b',
-                              line_color='#c7d5cc', goal_type='box')
-                pitch.draw(ax=ax)
+            async def field_eficacia():
+                stats = await get_heatmap_stats()
+                fig, axs = _make_custom_grid(figheight=8)
+                pitch = Pitch(pitch_type='statsbomb', line_color='black', pitch_color='white', line_zorder=2)
+                pitch.draw(ax=axs['pitch'])
 
                 if stats is None:
-                    ax.text(60, 40, "Sin datos analizados", color='white', ha='center', fontsize=13)
+                    axs['pitch'].text(60, 40, "Esperando análisis...", color='#94a3b8', ha='center', fontsize=14)
                     return fig
 
-                pcm = pitch.heatmap(stats['pct'], ax=ax, cmap='YlOrRd',
-                                    edgecolors='#22312b', lw=0.6, alpha=0.85)
-
-                cx = stats['pct']['cx'].flatten()
-                cy = stats['pct']['cy'].flatten()
-                pcts = stats['pct']['statistic'].flatten()
-                goals = stats['goal']['statistic'].flatten()
-                recs = stats['rec']['statistic'].flatten()
-                max_pct = pcts.max() if pcts.max() > 0 else 1
+                pcm = pitch.heatmap(stats['pct'], ax=axs['pitch'], cmap='Reds', edgecolor='black', linewidth=0.5, alpha=0.7)
+                cx, cy = stats['pct']['cx'].flatten(), stats['pct']['cy'].flatten()
+                pcts, goals, recs = stats['pct']['statistic'].flatten(), stats['goal']['statistic'].flatten(), stats['rec']['statistic'].flatten()
 
                 for i in range(len(cx)):
                     if recs[i] > 0:
-                        g_rel = goals[i] / recs[i] * 100
-                        txt = f"{pcts[i]:.1f}%\nG:{int(goals[i])} ({g_rel:.1f}%)"
-                        txt_color = 'white' if pcts[i] < (max_pct * 0.5) else 'black'
-                        pitch.text(cx[i], cy[i], txt, ax=ax,
-                                   color=txt_color, fontsize=8.5,
-                                   ha='center', va='center', fontweight='bold')
+                        txt = f"{pcts[i]:.1f}%\nG:{int(goals[i])}"
+                        pitch.text(cx[i], cy[i], txt, ax=axs['pitch'], color='black', fontsize=8, ha='center', va='center', fontweight='bold')
 
-                cb = fig.colorbar(pcm, cax=ax_cbar)
-                cb.ax.tick_params(colors='white', labelsize=9)
-                cb.set_label('% Eficacia (Tiro)', color='white', size=10)
+                cb = plt.colorbar(pcm, cax=axs['cbar'])
+                cb.ax.tick_params(labelsize=8)
+                cb.set_label('% Eficacia (Transición a Tiro)', size=9)
 
-                ax_title.text(0.5, 0.4, "Eficacia de Transición (%) y Conversión a Goles (G)",
-                              color='white', ha='center', va='center', fontsize=13, fontweight='bold',
-                              transform=ax_title.transAxes)
-
-                ax_endnote.text(0.5, 0.6, "▶  DIRECCIÓN DE ATAQUE  (portería rival →)",
-                                color='#c7d5cc', ha='center', va='center', fontsize=10, fontstyle='italic',
-                                transform=ax_endnote.transAxes)
+                axs['title'].text(0, 0.7, "Eficacia de Transición (%) y Goles (G)", fontsize=18, fontweight='800', color='#0f172a')
+                axs['title'].text(0, 0.2, "Porcentaje de recuperaciones que terminan en tiro por zona", fontsize=11, color='#64748b')
+                axs['endnote'].text(1, 0.5, "Dirección de ataque ➜", ha='right', va='center', fontsize=10, fontstyle='italic', color='#64748b')
                 return fig
 
-# 2. SECCIONES INFERIORES: Metodología y Resultados
-# col_widths: suma 12. Ej: [5,7], [6,6], [4,8]. Para el alto usa max-height en px.
+# ─────────────────────────────────────────────
+# SECCIONES INFERIORES: Metodología y Resultados
+# ─────────────────────────────────────────────
 with ui.layout_columns(col_widths=[6, 6]):
     with ui.card(style="max-height: 350px; overflow-y: auto;"):
-        ui.card_header("SECCIÓN METODOLOGÍA", style="font-weight: bold; background-color: #f8f9fa;")
+        ui.card_header("Metodología de Análisis")
         ui.markdown("""
-        **Origen de datos**: StatsBomb Open Data.
+        Se analizan los eventos de **Ball Recovery** y se rastrea la posesión hasta su finalización.
         
-        **Campos de Análisis**:
-        *   **Campo 1 (Volumen)**: Número total de recuperaciones (R) y tiros generados (T). El color indica densidad.
-        *   **Campo 2 (Eficacia)**: % de recuperaciones que acaban en tiro, goles (G) y su porcentaje relativo.
+        *   **Volumen**: Densidad de recuperaciones por zona.
+        *   **Eficacia**: % de recuperaciones que terminan en tiro.
         
-        **Lógica**: Recuperaciones cuya posesión termina en tiro/gol bajo los **patrones de juego seleccionados**.
+        **Origen**: StatsBomb Open Data.
         """)
 
     with ui.card(style="max-height: 350px; overflow-y: auto;"):
-        ui.card_header("SECCIÓN RESULTADOS", style="font-weight: bold; background-color: #f8f9fa;")
+        ui.card_header("Resumen de Resultados")
         @render.ui
-        def analysis_summary():
-            data = process_data()
+        async def analysis_summary():
+            data = await process_data()
             if data is None or data.empty:
-                return ui.p("Sin datos analizados.")
+                return ui.p("Esperando selección de datos...", style="color: var(--muted); padding: 1rem;")
             
             total = len(data)
             shots = int(data['ends_in_shot'].sum())
@@ -432,20 +490,15 @@ with ui.layout_columns(col_widths=[6, 6]):
             pct_shot = (shots / total) * 100
             pct_goal = (goals / total) * 100
             
-            return ui.div(
-                ui.div(
-                    ui.h3(f"{total:,}", style="margin:0; color:#3498db;"),
-                    ui.p("Recuperaciones totales", style="margin:0; font-size:0.85em; color:#7f8c8d;"),
-                    style="margin-bottom: 10px;"
-                ),
-                ui.div(
-                    ui.h3(f"{pct_shot:.2f}%", style="margin:0; color:#e67e22;"),
-                    ui.p("Eficacia (Transición a Tiro)", style="margin:0; font-size:0.85em; color:#7f8c8d;"),
-                    style="margin-bottom: 10px;"
-                ),
-                ui.div(
-                    ui.h3(f"{goals:,} Goles", style="margin:0; color:#e74c3c;"),
-                    ui.p(f"Conversión total ({pct_goal:.2f}% de rec.)", style="margin:0; font-size:0.85em; color:#7f8c8d;"),
-                    style="margin-bottom: 10px;"
-                )
-            )
+            with ui.layout_columns(col_widths=[4, 4, 4]):
+                with ui.div(class_="kpi-item"):
+                    ui.div(f"{total:,}", class_="kpi-value", style="color: #1e40af; font-size: 1.5rem;")
+                    ui.div("Recuperaciones", class_="kpi-label", style="font-size: 0.7rem;")
+                with ui.div(class_="kpi-item"):
+                    ui.div(f"{pct_shot:.1f}%", class_="kpi-value", style="color: #0891b2; font-size: 1.5rem;")
+                    ui.div("Eficacia", class_="kpi-label", style="font-size: 0.7rem;")
+                with ui.div(class_="kpi-item"):
+                    ui.div(f"{goals}", class_="kpi-value", style="color: #be123c; font-size: 1.5rem;")
+                    ui.div("Goles", class_="kpi-label", style="font-size: 0.7rem;")
+
+
