@@ -1,0 +1,7 @@
+shiny
+statsbombpy
+pandas
+mplsoccer
+matplotlib
+scipy
+shinyswatch
