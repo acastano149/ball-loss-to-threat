@@ -22,7 +22,10 @@ ui.page_opts(
 # ─────────────────────────────────────────────
 
 # Columnas mínimas necesarias para el análisis
-COLS_NEEDED = ['type', 'play_pattern', 'possession', 'team', 'location', 'shot_outcome']
+COLS_NEEDED = [
+    'type', 'play_pattern', 'possession', 'team', 'location', 'shot_outcome',
+    'ball_recovery_recovery_failure', 'interception_outcome', 'duel_type', 'duel_outcome'
+]
 
 @functools.lru_cache(maxsize=256)
 def _fetch_events_cached(match_id: int) -> pd.DataFrame:
@@ -45,12 +48,24 @@ def _process_single_match(match_id: int, team_set: frozenset, pattern_set: froze
         (events['play_pattern'].isin(pattern_set))
     ]
     posessions_with_shot = frozenset(shots['possession'].unique())
-    
+
     # Goles
     goals = shots[shots['shot_outcome'] == 'Goal']
     posessions_with_goal = frozenset(goals['possession'].unique())
 
-    recoveries = events[events['type'] == 'Ball Recovery'].copy()
+    mask_rec = (events['type'] == 'Ball Recovery') & (events['ball_recovery_recovery_failure'].isna())
+
+    success_interception = ['Won', 'Success', 'In Play']
+    mask_int = (events['type'] == 'Interception') & (
+            (events['interception_outcome'].isin(success_interception)) | (events['interception_outcome'].isna())
+    )
+
+    mask_tackle = (events['type'] == 'Duel') & (events['duel_type'] == 'Tackle') & (
+        events['duel_outcome'].isin(['Won', 'Success'])
+    )
+
+    recoveries = events[mask_rec | mask_int | mask_tackle].copy()
+    
     if recoveries.empty:
         return None
 
@@ -140,7 +155,7 @@ with ui.sidebar(width=350, bg="#f8f9fa"):
 def get_matches():
     if not input.competition_ids() or not input.season_ids():
         return None
-    
+
     selected_comps = input.competition_ids()
     selected_seasons = input.season_ids()
     
