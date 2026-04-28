@@ -1,0 +1,803 @@
+---
+title: "Riesgo de pérdidas peligrosas y transiciones ofensivas"
+subtitle: "Análisis reproducible con Python, StatsBomb Open Data y regresión logística"
+author: "BeyondPlay"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+jupyter: python3
+---
+
+## Objetivo
+
+Este documento convierte el análisis de la app en un flujo reproducible tipo *notebook*:
+
+1.  Cargar eventos de StatsBomb.
+2.  Detectar **inicios de transición ofensiva**: `Ball Recovery` exitosa, `Interception` exitosa y `Duel - Tackle` ganado.
+3.  Detectar **pérdidas propias** y etiquetar cuáles son **peligrosas**.
+4.  Visualizar el volumen y la eficacia de transiciones.
+5.  Visualizar zonas de pérdida y zonas de pérdida peligrosa.
+6.  Ajustar una **regresión logística binomial** para modelar `P(pérdida peligrosa)`.
+7.  Dibujar curvas y mapas de probabilidad predicha.
+
+La inspiración metodológica es la lógica de los modelos xG: construir una variable objetivo binaria, crear variables geométricas, visualizar probabilidades empíricas, ajustar un GLM binomial/logístico y comparar la curva/modelo con los datos observados.
+
+> **Interpretación táctica:** no buscamos solo dónde se pierde la pelota, sino dónde perderla se convierte en una amenaza inmediata para el rival.
+
+## Instalación y ejecución
+
+Ejecuta este documento con:
+
+``` bash
+quarto render riesgo_perdidas_transiciones.qmd
+```
+
+Dependencias recomendadas:
+
+``` bash
+pip install pandas numpy matplotlib statsbombpy mplsoccer statsmodels scikit-learn
+```
+
+## 1. Configuración del análisis
+
+**Paso 1.** Edita estos parámetros para cambiar el alcance del análisis.
+
+-   `MATCH_IDS`: lista de partidos concretos. Por defecto usa el partido de ejemplo `15946`.
+-   `TEAM_NAMES`: deja `None` para analizar ambos equipos, o usa una lista, por ejemplo `['Barcelona']`.
+-   `TRANSITION_PATTERNS`: por defecto `['From Counter']`; usa `None` para no filtrar las transiciones por patrón.
+-   `DANGER_WINDOW`: ventana temporal, en segundos, para decidir si una pérdida genera peligro inmediato.
+
+```{python}
+#| label: config
+
+COMPETITION_ID = 9      # 1. Bundesliga
+SEASON_ID = 281         # 2023/2024
+
+TEAM_NAMES = ['Bayer Leverkusen']
+
+# Si MATCH_IDS = None, se cargarán automáticamente todos los partidos
+# de la competición/temporada en los que participe TEAM_NAMES.
+MATCH_IDS = None
+
+# Para contraataques estrictos de StatsBomb:
+TRANSITION_PATTERNS = ['From Counter']
+
+# Si quieres transiciones más amplias, usa:
+# TRANSITION_PATTERNS = None
+
+DANGER_WINDOW = 15
+
+# Definición de pérdida peligrosa.
+DANGER_INCLUDES_SHOT = True
+DANGER_INCLUDES_BOX_ENTRY = True
+DANGER_INCLUDES_COUNTER = True
+
+# Si True, solo considera pérdidas propias en posesiones cuyo play_pattern esté en TRANSITION_PATTERNS.
+# En general recomiendo False para modelar riesgo global de pérdida.
+FILTER_LOSSES_BY_PATTERN = False
+```
+
+## 2. Importación de librerías
+
+**Paso 2.** Cargamos librerías de datos, visualización, datos StatsBomb y modelización estadística.
+
+```{python}
+#| label: imports
+
+import math
+import warnings
+from functools import lru_cache
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from statsbombpy import sb
+from mplsoccer import Pitch
+
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+try:
+    from sklearn.metrics import roc_auc_score
+except Exception:
+    roc_auc_score = None
+
+warnings.filterwarnings('ignore')
+pd.set_option('display.max_columns', 100)
+```
+
+## 3. Constantes y utilidades
+
+**Paso 3.** Definimos dimensiones del campo StatsBomb y funciones auxiliares para coordenadas, segundos de partido y localización final de acciones.
+
+```{python}
+#| label: constants-helpers
+
+PITCH_LENGTH = 120
+PITCH_WIDTH = 80
+GOAL_Y = 40
+BOX_ENTRY_X = 102
+
+TRANSITION_RECOVERY_SUCCESS = ['Won', 'Success', 'Success In Play']
+TACKLE_SUCCESS = ['Won', 'Success', 'Success In Play']
+
+LOSS_CANDIDATE_TYPES = [
+    'Pass', 'Carry', 'Dribble', 'Miscontrol', 'Dispossessed', 'Ball Receipt*'
+]
+
+COLS_NEEDED = [
+    'id', 'index', 'period', 'timestamp', 'minute', 'second',
+    'type', 'play_pattern', 'possession', 'possession_team', 'team',
+    'location', 'under_pressure',
+    'shot_outcome', 'shot_statsbomb_xg',
+    'ball_recovery_recovery_failure',
+    'interception_outcome', 'duel_type', 'duel_outcome',
+    'pass_outcome', 'pass_length', 'pass_angle', 'pass_height', 'pass_end_location', 'pass_type',
+    'carry_end_location',
+    'dribble_outcome',
+    'ball_receipt_outcome',
+    'miscontrol_aerial_won',
+    'counterpress',
+]
+
+
+def safe_list(value):
+    return isinstance(value, (list, tuple)) and len(value) >= 2
+
+
+def x_from_location(value):
+    return float(value[0]) if safe_list(value) else np.nan
+
+
+def y_from_location(value):
+    return float(value[1]) if safe_list(value) else np.nan
+
+
+def end_location(row):
+    """Devuelve la localización final de pase o conducción si existe."""
+    for col in ['pass_end_location', 'carry_end_location']:
+        value = row.get(col, None)
+        if safe_list(value):
+            return float(value[0]), float(value[1])
+    return np.nan, np.nan
+
+
+def end_x(row):
+    x_end, _ = end_location(row)
+    return x_end
+
+
+def is_true(value):
+    if pd.isna(value):
+        return 0
+    if isinstance(value, str):
+        return int(value.lower() in ['true', '1', 'yes', 'sí', 'si'])
+    return int(bool(value))
+
+
+def timestamp_to_seconds(value):
+    if pd.isna(value):
+        return np.nan
+    if hasattr(value, 'hour') and hasattr(value, 'minute') and hasattr(value, 'second'):
+        return value.hour * 3600 + value.minute * 60 + value.second + value.microsecond / 1_000_000
+    try:
+        parts = str(value).split(':')
+        if len(parts) == 3:
+            h, m, s = map(float, parts)
+            return h * 3600 + m * 60 + s
+    except Exception:
+        return np.nan
+    return np.nan
+
+
+def box_entry_mask(df):
+    """Entrada al área rival: localización o final de acción con x >= 102 en escala StatsBomb."""
+    if df.empty:
+        return pd.Series(False, index=df.index)
+    loc_entry = df['x'].fillna(-1) >= BOX_ENTRY_X
+    end_entry = df.apply(lambda r: end_x(r), axis=1).fillna(-1) >= BOX_ENTRY_X
+    return loc_entry | end_entry
+```
+
+## 4. Carga y preparación de eventos
+
+**Paso 4.** Descargamos los eventos con `statsbombpy`, creamos columnas faltantes como `NA`, ordenamos los eventos y separamos coordenadas `x, y`.
+
+```{python}
+#| label: load-events
+
+
+def prepare_events(events):
+    events = events.copy()
+
+    for col in COLS_NEEDED:
+        if col not in events.columns:
+            events[col] = pd.NA
+
+    if events['index'].isna().all():
+        events['event_order'] = np.arange(len(events))
+    else:
+        events['event_order'] = pd.to_numeric(events['index'], errors='coerce')
+        events['event_order'] = events['event_order'].fillna(pd.Series(np.arange(len(events)), index=events.index))
+
+    if not events['minute'].isna().all() and not events['second'].isna().all():
+        events['event_seconds'] = (
+            pd.to_numeric(events['minute'], errors='coerce').fillna(0) * 60
+            + pd.to_numeric(events['second'], errors='coerce').fillna(0)
+        )
+    else:
+        events['event_seconds'] = events['timestamp'].apply(timestamp_to_seconds)
+
+    events['period'] = pd.to_numeric(events['period'], errors='coerce').fillna(0).astype(int)
+    events['possession'] = pd.to_numeric(events['possession'], errors='coerce')
+    events['x'] = events['location'].apply(x_from_location)
+    events['y'] = events['location'].apply(y_from_location)
+
+    return events.sort_values(['period', 'event_order']).reset_index(drop=True)
+
+
+@lru_cache(maxsize=256)
+def fetch_events(match_id):
+    events = sb.events(match_id=int(match_id))
+    keep = [c for c in COLS_NEEDED if c in events.columns]
+    events = events[keep].copy()
+    events = prepare_events(events)
+    events['match_id'] = int(match_id)
+    return events
+
+
+# Si MATCH_IDS no se define manualmente, buscamos los partidos
+# de la competición/temporada seleccionada.
+if MATCH_IDS is None:
+    matches = sb.matches(
+        competition_id=COMPETITION_ID,
+        season_id=SEASON_ID
+    )
+
+    if TEAM_NAMES is None:
+        selected_matches = matches.copy()
+    else:
+        selected_matches = matches[
+            matches['home_team'].isin(TEAM_NAMES)
+            | matches['away_team'].isin(TEAM_NAMES)
+        ].copy()
+
+    MATCH_IDS = selected_matches['match_id'].tolist()
+
+    print(f'Partidos encontrados: {len(MATCH_IDS)}')
+    display(
+        selected_matches[
+            ['match_id', 'match_date', 'home_team', 'away_team', 'home_score', 'away_score']
+        ].sort_values('match_date')
+    )
+
+all_events = []
+for match_id in MATCH_IDS:
+    ev = fetch_events(match_id)
+    all_events.append(ev)
+
+events = pd.concat(all_events, ignore_index=True)
+
+if TEAM_NAMES is None:
+    TEAM_SET = frozenset(events['team'].dropna().unique())
+else:
+    TEAM_SET = frozenset(TEAM_NAMES)
+
+PATTERN_SET = frozenset(TRANSITION_PATTERNS or [])
+
+print(f'Eventos cargados: {len(events):,}')
+print(f'Partidos: {events["match_id"].nunique()}')
+print(f'Equipos analizados: {sorted(TEAM_SET)}')
+```
+
+## 5. Metadatos de posesión
+
+**Paso 5.** Agrupamos eventos por `period` y `possession`. Esto permite saber quién tenía la posesión, cuándo empieza/acaba y qué patrón de juego tenía.
+
+```{python}
+#| label: possession-meta
+
+
+def possession_meta(events):
+    return (
+        events.dropna(subset=['possession'])
+        .sort_values(['period', 'event_order'])
+        .groupby(['match_id', 'period', 'possession'], observed=True)
+        .agg(
+            possession_team=('possession_team', 'first'),
+            play_pattern=('play_pattern', 'first'),
+            start_order=('event_order', 'min'),
+            end_order=('event_order', 'max'),
+            start_seconds=('event_seconds', 'min'),
+            end_seconds=('event_seconds', 'max'),
+        )
+        .reset_index()
+    )
+
+
+def next_possession_for_team(meta, match_id, period, order, team):
+    candidates = meta[
+        (meta['match_id'] == match_id)
+        & (meta['period'] == period)
+        & (meta['possession_team'] == team)
+        & (meta['start_order'] >= order)
+    ].sort_values('start_order')
+    if candidates.empty:
+        return np.nan, None
+    row = candidates.iloc[0]
+    return row['possession'], row['play_pattern']
+
+
+def next_opponent_possession(meta, match_id, period, order, team):
+    candidates = meta[
+        (meta['match_id'] == match_id)
+        & (meta['period'] == period)
+        & (meta['possession_team'] != team)
+        & (meta['start_order'] > order)
+    ].sort_values('start_order')
+    if candidates.empty:
+        return None
+    return candidates.iloc[0]
+
+
+meta = possession_meta(events)
+meta.head()
+```
+
+> # [*Transiciones ofensivas propias (ataques a favor)*]{.underline}
+
+## 6. Detección de inicios de transición ofensiva. 
+
+**Paso 6.** Definimos como inicio de transición una acción que recupera posesión de forma útil:
+
+-   `Ball Recovery` sin fallo.
+-   `Interception` con resultado exitoso.
+-   `Duel` de tipo `Tackle` con resultado ganado/exitoso.
+
+Después asociamos esa acción a la posesión atacante del equipo y comprobamos si esa posesión acaba en tiro o gol.
+
+```{python}
+#| label: transition-starts
+
+
+def build_transition_starts(events, team_set, pattern_set):
+    ev = events[events['team'].isin(team_set)].copy()
+    if ev.empty:
+        return pd.DataFrame()
+
+    meta = possession_meta(events)
+
+    mask_recovery = (
+        (ev['type'] == 'Ball Recovery')
+        & (ev['ball_recovery_recovery_failure'].isna())
+    )
+    mask_interception = (
+        (ev['type'] == 'Interception')
+        & (ev['interception_outcome'].astype('object').isin(TRANSITION_RECOVERY_SUCCESS))
+    )
+    mask_tackle = (
+        (ev['type'] == 'Duel')
+        & (ev['duel_type'] == 'Tackle')
+        & (ev['duel_outcome'].astype('object').isin(TACKLE_SUCCESS))
+    )
+
+    starts = ev[mask_recovery | mask_interception | mask_tackle].copy()
+    if starts.empty:
+        return pd.DataFrame()
+
+    transition_possessions = []
+    transition_patterns = []
+
+    for _, row in starts.iterrows():
+        if row.get('possession_team') == row.get('team'):
+            transition_possessions.append(row.get('possession'))
+            transition_patterns.append(row.get('play_pattern'))
+        else:
+            poss, pattern = next_possession_for_team(
+                meta,
+                int(row['match_id']),
+                int(row['period']),
+                float(row['event_order']),
+                row['team'],
+            )
+            transition_possessions.append(poss)
+            transition_patterns.append(pattern)
+
+    starts['transition_possession'] = transition_possessions
+    starts['transition_play_pattern'] = transition_patterns
+    starts = starts.dropna(subset=['transition_possession', 'x', 'y'])
+
+    if pattern_set:
+        starts = starts[starts['transition_play_pattern'].isin(pattern_set)]
+
+    if starts.empty:
+        return pd.DataFrame()
+
+    selected_shots = events[
+        (events['team'].isin(team_set))
+        & (events['type'] == 'Shot')
+    ].copy()
+
+    if pattern_set:
+        selected_shots = selected_shots[selected_shots['play_pattern'].isin(pattern_set)]
+
+    possessions_with_shot = frozenset(selected_shots['possession'].dropna().unique())
+    possessions_with_goal = frozenset(
+        selected_shots.loc[selected_shots['shot_outcome'] == 'Goal', 'possession'].dropna().unique()
+    )
+
+    starts['ends_in_shot'] = starts['transition_possession'].isin(possessions_with_shot).astype(int)
+    starts['ends_in_goal'] = starts['transition_possession'].isin(possessions_with_goal).astype(int)
+    starts['start_type'] = starts['type'].astype('object')
+
+    return starts[[
+        'match_id', 'period', 'team', 'x', 'y', 'start_type',
+        'transition_possession', 'transition_play_pattern', 'ends_in_shot', 'ends_in_goal'
+    ]]
+
+
+transitions = build_transition_starts(events, TEAM_SET, PATTERN_SET)
+
+summary_transitions = (
+    transitions.groupby('start_type', observed=True)
+    .agg(
+        acciones=('start_type', 'count'),
+        acaban_en_tiro=('ends_in_shot', 'sum'),
+        acaban_en_gol=('ends_in_goal', 'sum'),
+        pct_tiro=('ends_in_shot', 'mean'),
+    )
+    .reset_index()
+    .sort_values('acciones', ascending=False)
+)
+
+summary_transitions['pct_tiro'] = (100 * summary_transitions['pct_tiro']).round(1)
+summary_transitions
+```
+
+## 7. Visualización de transiciones
+
+**Paso 7.** Pintamos dos mapas:
+
+1.  Volumen de inicios de transición.
+2.  Porcentaje de inicios de transición que acaban en tiro.
+
+```{python}
+#| label: transition-visual-functions
+
+
+def plot_transition_volume(transitions):
+    if transitions.empty:
+        print('No hay transiciones con los filtros elegidos.')
+        return
+
+    data = transitions.dropna(subset=['x', 'y'])
+    pitch = Pitch(pitch_type='statsbomb', line_color='black', pitch_color='white', line_zorder=2)
+    bin_rec = pitch.bin_statistic(data.x, data.y, statistic='count', bins=(12, 8))
+    bin_shot = pitch.bin_statistic(data.x, data.y, values=data.ends_in_shot, statistic='sum', bins=(12, 8))
+
+    fig, ax = pitch.draw(figsize=(12, 8))
+    pcm = pitch.heatmap(bin_rec, ax=ax, cmap='Reds', edgecolor='black', linewidth=0.5, alpha=0.75)
+    plt.colorbar(pcm, ax=ax, fraction=0.03, pad=0.02, label='Inicios de transición')
+
+    cx = bin_rec['cx'].flatten()
+    cy = bin_rec['cy'].flatten()
+    recs = np.nan_to_num(bin_rec['statistic'].flatten())
+    shots = np.nan_to_num(bin_shot['statistic'].flatten())
+
+    for i in range(len(cx)):
+        if recs[i] > 0:
+            pitch.text(cx[i], cy[i], f'R:{int(recs[i])}\nT:{int(shots[i])}', ax=ax,
+                       fontsize=8, ha='center', va='center', fontweight='bold')
+
+    ax.set_title('Volumen de inicios de transición\nR = recuperaciones/intercepciones/tackles; T = transiciones que acaban en tiro')
+    plt.show()
+
+
+def plot_transition_efficiency(transitions):
+    if transitions.empty:
+        print('No hay transiciones con los filtros elegidos.')
+        return
+
+    data = transitions.dropna(subset=['x', 'y'])
+    pitch = Pitch(pitch_type='statsbomb', line_color='black', pitch_color='white', line_zorder=2)
+    bin_rec = pitch.bin_statistic(data.x, data.y, statistic='count', bins=(12, 8))
+    bin_pct = pitch.bin_statistic(data.x, data.y, values=data.ends_in_shot, statistic='mean', bins=(12, 8))
+    bin_goal = pitch.bin_statistic(data.x, data.y, values=data.ends_in_goal, statistic='sum', bins=(12, 8))
+    bin_pct['statistic'] = np.nan_to_num(bin_pct['statistic'] * 100)
+
+    fig, ax = pitch.draw(figsize=(12, 8))
+    pcm = pitch.heatmap(bin_pct, ax=ax, cmap='Reds', edgecolor='black', linewidth=0.5, alpha=0.75, vmin=0, vmax=100)
+    plt.colorbar(pcm, ax=ax, fraction=0.03, pad=0.02, label='% que acaba en tiro')
+
+    cx = bin_pct['cx'].flatten()
+    cy = bin_pct['cy'].flatten()
+    pcts = np.nan_to_num(bin_pct['statistic'].flatten())
+    goals = np.nan_to_num(bin_goal['statistic'].flatten())
+    recs = np.nan_to_num(bin_rec['statistic'].flatten())
+
+    for i in range(len(cx)):
+        if recs[i] > 0:
+            pitch.text(cx[i], cy[i], f'{pcts[i]:.1f}%\nG:{int(goals[i])}', ax=ax,
+                       fontsize=8, ha='center', va='center', fontweight='bold')
+
+    ax.set_title('Eficacia tras inicio de transición\n% = acaba en tiro; G = goles')
+    plt.show()
+```
+
+```{python}
+#| label: plot-transitions
+
+plot_transition_volume(transitions)
+plot_transition_efficiency(transitions)
+```
+
+> # [*Transiciones defensivas/pérdidas propias*]{.underline}
+
+## 8. Detección de pérdidas propias
+
+**Paso 8.** Para cada posesión propia, tomamos la última acción ofensiva con localización antes de que la posesión pase al rival. Esa acción se etiqueta como pérdida.
+
+Luego miramos la siguiente posesión rival y marcamos la pérdida como peligrosa si, dentro de `DANGER_WINDOW` segundos, el rival:
+
+-   tira;
+-   entra al área;
+-   o la posesión rival está etiquetada como `From Counter`.
+
+```{python}
+#| label: loss-detection
+
+
+def build_loss_events(
+    events,
+    team_set,
+    danger_window=15,
+    include_shots=True,
+    include_box_entries=True,
+    include_counters=True,
+    filter_losses_by_pattern=False,
+    pattern_set=frozenset(),
+):
+    meta = possession_meta(events)
+    if meta.empty:
+        return pd.DataFrame()
+
+    own_possessions = meta[meta['possession_team'].isin(team_set)].copy()
+
+    if filter_losses_by_pattern and pattern_set:
+        own_possessions = own_possessions[own_possessions['play_pattern'].isin(pattern_set)]
+
+    rows = []
+
+    for _, poss in own_possessions.iterrows():
+        match_id = int(poss['match_id'])
+        team = poss['possession_team']
+        period = int(poss['period'])
+        possession_id = poss['possession']
+
+        possession_events = events[
+            (events['match_id'] == match_id)
+            & (events['period'] == period)
+            & (events['possession'] == possession_id)
+            & (events['team'] == team)
+        ].copy()
+
+        candidates = possession_events[
+            possession_events['type'].astype('object').isin(LOSS_CANDIDATE_TYPES)
+            & possession_events['x'].notna()
+            & possession_events['y'].notna()
+        ].copy()
+
+        if candidates.empty:
+            continue
+
+        loss_event = candidates.sort_values('event_order').iloc[-1]
+
+        next_poss = next_opponent_possession(
+            meta,
+            match_id=match_id,
+            period=period,
+            order=float(poss['end_order']),
+            team=team,
+        )
+        if next_poss is None:
+            continue
+
+        opponent = next_poss['possession_team']
+        next_events = events[
+            (events['match_id'] == match_id)
+            & (events['period'] == period)
+            & (events['possession'] == next_poss['possession'])
+            & (events['team'] == opponent)
+        ].copy()
+
+        if next_events.empty:
+            continue
+
+        t0 = float(loss_event['event_seconds']) if pd.notna(loss_event['event_seconds']) else float(poss['end_seconds'])
+        next_events['time_after_loss'] = next_events['event_seconds'] - t0
+        window_events = next_events[
+            (next_events['time_after_loss'] >= 0)
+            & (next_events['time_after_loss'] <= danger_window)
+        ].copy()
+
+        opponent_shot = bool((window_events['type'] == 'Shot').any())
+        opponent_box_entry = bool(box_entry_mask(window_events).any()) if include_box_entries else False
+        opponent_counter = bool((next_events['play_pattern'] == 'From Counter').any())
+
+        danger_components = []
+        if include_shots:
+            danger_components.append(opponent_shot)
+        if include_box_entries:
+            danger_components.append(opponent_box_entry)
+        if include_counters:
+            danger_components.append(opponent_counter)
+
+        dangerous_loss = bool(any(danger_components)) if danger_components else opponent_shot
+
+        x_end, y_end = end_location(loss_event)
+        forward_progress = x_end - float(loss_event['x']) if pd.notna(x_end) else 0.0
+
+        action_length = loss_event.get('pass_length', np.nan)
+        if pd.isna(action_length) and pd.notna(x_end) and pd.notna(y_end):
+            action_length = math.sqrt((x_end - float(loss_event['x'])) ** 2 + (y_end - float(loss_event['y'])) ** 2)
+
+        x = float(loss_event['x'])
+        y = float(loss_event['y'])
+
+        rows.append({
+            'match_id': match_id,
+            'period': period,
+            'team': team,
+            'opponent': opponent,
+            'possession': possession_id,
+            'play_pattern': poss['play_pattern'],
+            'action_type': loss_event['type'],
+            'x': x,
+            'y': y,
+            'centrality': abs(y - GOAL_Y),
+            'distance_to_own_goal': math.sqrt(x ** 2 + (y - GOAL_Y) ** 2),
+            'distance_to_opponent_goal': math.sqrt((PITCH_LENGTH - x) ** 2 + (y - GOAL_Y) ** 2),
+            'under_pressure': is_true(loss_event.get('under_pressure', pd.NA)),
+            'action_length': float(action_length) if pd.notna(action_length) else 0.0,
+            'forward_progress': float(forward_progress) if pd.notna(forward_progress) else 0.0,
+            'opponent_shot': int(opponent_shot),
+            'opponent_box_entry': int(opponent_box_entry),
+            'opponent_counter': int(opponent_counter),
+            'dangerous_loss': int(dangerous_loss),
+        })
+
+    return pd.DataFrame(rows)
+
+
+losses = build_loss_events(
+    events,
+    team_set=TEAM_SET,
+    danger_window=DANGER_WINDOW,
+    include_shots=DANGER_INCLUDES_SHOT,
+    include_box_entries=DANGER_INCLUDES_BOX_ENTRY,
+    include_counters=DANGER_INCLUDES_COUNTER,
+    filter_losses_by_pattern=FILTER_LOSSES_BY_PATTERN,
+    pattern_set=PATTERN_SET,
+)
+
+print(f'Pérdidas detectadas: {len(losses):,}')
+print(f'Pérdidas peligrosas: {losses["dangerous_loss"].sum():,}' if not losses.empty else 'Sin pérdidas detectadas')
+
+losses.head()
+```
+
+## 9. Resumen descriptivo de pérdidas
+
+**Paso 9.** Antes de modelar, revisamos si el target tiene sentido: volumen por tipo de acción y porcentaje que acaba siendo peligroso.
+
+```{python}
+#| label: loss-summary
+
+if losses.empty:
+    loss_summary = pd.DataFrame()
+else:
+    loss_summary = (
+        losses.groupby('action_type', observed=True)
+        .agg(
+            perdidas=('action_type', 'count'),
+            peligrosas=('dangerous_loss', 'sum'),
+            pct_peligrosas=('dangerous_loss', 'mean'),
+            tiros_rivales=('opponent_shot', 'sum'),
+            entradas_area=('opponent_box_entry', 'sum'),
+            contraataques=('opponent_counter', 'sum'),
+        )
+        .reset_index()
+        .sort_values('perdidas', ascending=False)
+    )
+    loss_summary['pct_peligrosas'] = (100 * loss_summary['pct_peligrosas']).round(1)
+
+loss_summary
+```
+
+## 10. Visualización de pérdidas peligrosas
+
+**Paso 10.** Construimos el espejo del mapa de transiciones:
+
+1.  Volumen de pérdidas.
+2.  Riesgo empírico de pérdida peligrosa por zona.
+
+```{python}
+#| label: loss-visual-functions
+
+
+def plot_loss_volume(losses):
+    if losses.empty:
+        print('No hay pérdidas con los filtros elegidos.')
+        return
+
+    data = losses.dropna(subset=['x', 'y'])
+    pitch = Pitch(pitch_type='statsbomb', line_color='black', pitch_color='white', line_zorder=2)
+    bin_loss = pitch.bin_statistic(data.x, data.y, statistic='count', bins=(12, 8))
+    bin_danger = pitch.bin_statistic(data.x, data.y, values=data.dangerous_loss, statistic='sum', bins=(12, 8))
+
+    fig, ax = pitch.draw(figsize=(12, 8))
+    pcm = pitch.heatmap(bin_loss, ax=ax, cmap='Reds', edgecolor='black', linewidth=0.5, alpha=0.75)
+    plt.colorbar(pcm, ax=ax, fraction=0.03, pad=0.02, label='Pérdidas')
+
+    cx = bin_loss['cx'].flatten()
+    cy = bin_loss['cy'].flatten()
+    total = np.nan_to_num(bin_loss['statistic'].flatten())
+    danger = np.nan_to_num(bin_danger['statistic'].flatten())
+
+    for i in range(len(cx)):
+        if total[i] > 0:
+            pitch.text(cx[i], cy[i], f'P:{int(total[i])}\nD:{int(danger[i])}', ax=ax,
+                       fontsize=8, ha='center', va='center', fontweight='bold')
+
+    ax.set_title('Volumen de pérdidas\nP = pérdidas; D = pérdidas peligrosas')
+    plt.show()
+
+
+def plot_loss_risk(losses):
+    if losses.empty:
+        print('No hay pérdidas con los filtros elegidos.')
+        return
+
+    data = losses.dropna(subset=['x', 'y'])
+    pitch = Pitch(pitch_type='statsbomb', line_color='black', pitch_color='white', line_zorder=2)
+    bin_loss = pitch.bin_statistic(data.x, data.y, statistic='count', bins=(12, 8))
+    bin_pct = pitch.bin_statistic(data.x, data.y, values=data.dangerous_loss, statistic='mean', bins=(12, 8))
+    bin_shot = pitch.bin_statistic(data.x, data.y, values=data.opponent_shot, statistic='sum', bins=(12, 8))
+    bin_pct['statistic'] = np.nan_to_num(bin_pct['statistic'] * 100)
+
+    fig, ax = pitch.draw(figsize=(12, 8))
+    vmax = max(5, float(np.nanmax(bin_pct['statistic'])))
+    pcm = pitch.heatmap(bin_pct, ax=ax, cmap='Reds', edgecolor='black', linewidth=0.5, alpha=0.75, vmin=0, vmax=vmax)
+    plt.colorbar(pcm, ax=ax, fraction=0.03, pad=0.02, label='% pérdidas peligrosas')
+
+    cx = bin_pct['cx'].flatten()
+    cy = bin_pct['cy'].flatten()
+    pcts = np.nan_to_num(bin_pct['statistic'].flatten())
+    shots = np.nan_to_num(bin_shot['statistic'].flatten())
+    total = np.nan_to_num(bin_loss['statistic'].flatten())
+
+    for i in range(len(cx)):
+        if total[i] > 0:
+            pitch.text(cx[i], cy[i], f'{pcts[i]:.1f}%\nTR:{int(shots[i])}', ax=ax,
+                       fontsize=8, ha='center', va='center', fontweight='bold')
+
+    ax.set_title('Riesgo empírico de pérdida peligrosa\nTR = tiros rivales tras pérdida')
+    plt.show()
+```
+
+```{python}
+#| label: plot-losses
+
+plot_loss_volume(losses)
+plot_loss_risk(losses)
+```
+
+> # FIN DE VISUALIZACIÓN
