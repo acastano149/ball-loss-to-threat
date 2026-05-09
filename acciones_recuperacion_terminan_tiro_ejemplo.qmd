@@ -1,0 +1,346 @@
+---
+title: "Acciones de recuperacion que terminan en tiro"
+subtitle: "Ejemplo sencillo con StatsBomb Open Data"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+execute:
+  warning: false
+  message: false
+jupyter: python3
+---
+
+# Acciones de recuperación que terminan en tiro
+
+Notebook sencillo para un partido de ejemplo.
+
+Buscamos acciones de recuperación/intercepción/tackle que pertenecen a posesiones que acaban en tiro. Después enriquecemos esas acciones con minuto, igualdad numérica y estado de marcador del equipo que perdió el balón.
+
+```{python}
+import warnings
+
+import numpy as np
+import pandas as pd
+from statsbombpy import sb
+
+try:
+    from IPython.display import display
+except Exception:
+    display = print
+
+warnings.filterwarnings("ignore")
+pd.set_option("display.max_columns", 120)
+pd.set_option("display.max_rows", 80)
+```
+
+## 1. Elegir partido
+
+Usamos un partido de Bundesliga 2023/2024. Si quieres otro partido, cambia `MATCH_ID`.
+
+```{python}
+# Bundesliga 2023/2024
+COMPETITION_ID = 9
+SEASON_ID = 281
+
+# None = usa el primer partido disponible de esa liga/temporada.
+# Tambien puedes poner un match_id concreto.
+MATCH_ID = None
+
+matches = sb.matches(competition_id=COMPETITION_ID, season_id=SEASON_ID).copy()
+matches = matches.sort_values(["match_date", "match_id"]).reset_index(drop=True)
+
+if MATCH_ID is None:
+    MATCH_ID = int(matches.loc[0, "match_id"])
+
+match_info = matches[matches["match_id"] == MATCH_ID].copy()
+home_team = match_info.iloc[0]["home_team"]
+away_team = match_info.iloc[0]["away_team"]
+
+print(f"MATCH_ID usado: {MATCH_ID}")
+display(match_info[["match_id", "match_date", "home_team", "away_team", "home_score", "away_score"]])
+```
+
+## 2. Cargar eventos
+
+Si falta alguna columna, la creamos con `pd.NA`. Esto evita que el notebook se rompa entre partidos con columnas distintas.
+
+```{python}
+COLS_NEEDED = [
+    "id", "index", "period", "timestamp", "minute", "second",
+    "type", "play_pattern", "possession", "possession_team", "team", "player",
+    "location",
+    "shot_outcome", "shot_statsbomb_xg",
+    "ball_recovery_recovery_failure",
+    "interception_outcome",
+    "duel_type", "duel_outcome",
+    # Para estimar igualdad numerica con rojas previas.
+    "foul_committed_card", "bad_behaviour_card",
+]
+
+
+def has_xy(value):
+    return isinstance(value, (list, tuple)) and len(value) >= 2
+
+
+def get_x(value):
+    return float(value[0]) if has_xy(value) else np.nan
+
+
+def get_y(value):
+    return float(value[1]) if has_xy(value) else np.nan
+
+
+def prepare_events(raw_events):
+    events = raw_events.copy()
+
+    # Rellenamos columnas que no existan en este partido.
+    for col in COLS_NEEDED:
+        if col not in events.columns:
+            events[col] = pd.NA
+
+    events = events[COLS_NEEDED].copy()
+
+    # Orden estable de eventos dentro del partido.
+    fallback_order = pd.Series(np.arange(len(events)), index=events.index)
+    events["event_order"] = pd.to_numeric(events["index"], errors="coerce").fillna(fallback_order)
+
+    # Coordenadas StatsBomb: location = [x, y].
+    events["x"] = events["location"].apply(get_x)
+    events["y"] = events["location"].apply(get_y)
+
+    events["period"] = pd.to_numeric(events["period"], errors="coerce").fillna(0).astype(int)
+    events["minute"] = pd.to_numeric(events["minute"], errors="coerce")
+    events["second"] = pd.to_numeric(events["second"], errors="coerce")
+    events["possession"] = pd.to_numeric(events["possession"], errors="coerce")
+    events["match_id"] = int(MATCH_ID)
+
+    return events.sort_values(["period", "event_order"]).reset_index(drop=True)
+
+
+raw_events = sb.events(match_id=MATCH_ID)
+events = prepare_events(raw_events)
+
+print(f"Eventos cargados: {len(events):,}")
+events.head()
+```
+
+## 3. Filtrar acciones de recuperación
+
+Este es el universo de acciones que nos interesa.
+
+```{python}
+TRANSITION_RECOVERY_SUCCESS = ["Won", "Success", "In Play", "Success In Play"]
+TACKLE_SUCCESS = ["Won", "Success", "Success In Play"]
+
+
+def build_recovery_actions(events):
+    df_actions = events[events["type"].isin(["Ball Recovery", "Interception", "Duel"])].copy()
+
+    mask_recovery = (
+        (df_actions["type"] == "Ball Recovery")
+        & (df_actions["ball_recovery_recovery_failure"].isna())
+    )
+
+    mask_interception = (
+        (df_actions["type"] == "Interception")
+        & (
+            df_actions["interception_outcome"].astype("object").isin(TRANSITION_RECOVERY_SUCCESS)
+            | df_actions["interception_outcome"].isna()
+        )
+    )
+
+    mask_tackle = (
+        (df_actions["type"] == "Duel")
+        & (df_actions["duel_type"] == "Tackle")
+        & (df_actions["duel_outcome"].astype("object").isin(TACKLE_SUCCESS))
+    )
+
+    recoveries = df_actions[mask_recovery | mask_interception | mask_tackle].copy()
+
+    # Nos quedamos solo con acciones que tienen equipo, posesion y ubicacion.
+    recoveries = recoveries.dropna(subset=["team", "possession", "x", "y"])
+    recoveries["recovery_action_type"] = recoveries["type"]
+    return recoveries
+
+
+recovery_actions = build_recovery_actions(events)
+
+print(f"Acciones de recuperación detectadas: {len(recovery_actions):,}")
+recovery_actions[["minute", "second", "team", "player", "recovery_action_type", "possession", "x", "y"]].head(20)
+```
+
+## 4. Quedarnos con las que terminan en tiro
+
+Una acción se queda si su misma posesión, para el mismo equipo, contiene un evento `Shot`.
+
+```{python}
+# Posesiones que contienen al menos un tiro.
+shots = events[events["type"] == "Shot"].copy()
+
+possessions_with_shot = (
+    shots[["match_id", "possession", "team"]]
+    .dropna(subset=["match_id", "possession", "team"])
+    .drop_duplicates()
+    .assign(ends_in_shot=1)
+)
+
+# Cruzamos recuperaciones con posesiones que acaban en tiro.
+actions_leading_to_shot = recovery_actions.merge(
+    possessions_with_shot,
+    on=["match_id", "possession", "team"],
+    how="inner",
+).sort_values(["period", "event_order"]).reset_index(drop=True)
+
+print(f"Tiros detectados: {len(shots):,}")
+print(f"Acciones de recuperación cuya posesión termina en tiro: {len(actions_leading_to_shot):,}")
+actions_leading_to_shot[["minute", "second", "team", "player", "recovery_action_type", "possession", "x", "y", "ends_in_shot"]]
+```
+
+## 5. Enriquecer las acciones
+
+Añadimos tres cosas:
+
+- `action_minute`: minuto decimal de partido.
+- `is_numerical_equality`: igualdad numérica estimada antes de la acción.
+- `losing_team_score_state`: si el equipo que perdió el balón iba ganando, empatando o perdiendo.
+
+```{python}
+def opponent_of(team):
+    """En este partido, devuelve el rival de un equipo."""
+    if team == home_team:
+        return away_team
+    if team == away_team:
+        return home_team
+    return pd.NA
+
+
+# Tabla sencilla de goles para reconstruir el marcador antes de cada accion.
+# Usamos Shot + Goal. Para empezar es suficiente y facil de revisar.
+goals = (
+    events[(events["type"] == "Shot") & (events["shot_outcome"] == "Goal")]
+    [["period", "event_order", "team"]]
+    .sort_values(["period", "event_order"])
+    .reset_index(drop=True)
+)
+
+
+# Tabla sencilla de rojas para estimar jugadores disponibles antes de cada accion.
+red_card_values = {"Red Card", "Second Yellow", "Second Yellow Card"}
+red_cards = events[
+    events[["foul_committed_card", "bad_behaviour_card"]]
+    .apply(lambda row: any(str(value) in red_card_values for value in row.dropna()), axis=1)
+][["period", "event_order", "team"]].copy()
+
+
+def score_state_before(period, event_order, team):
+    """Estado de marcador de un equipo antes de una accion."""
+    rival = opponent_of(team)
+    previous_goals = goals[
+        (goals["period"] < period)
+        | ((goals["period"] == period) & (goals["event_order"] < event_order))
+    ]
+
+    team_goals = int((previous_goals["team"] == team).sum())
+    rival_goals = int((previous_goals["team"] == rival).sum())
+    diff = team_goals - rival_goals
+
+    if diff > 0:
+        return "winning", diff
+    if diff < 0:
+        return "losing", diff
+    return "drawing", diff
+
+
+def numerical_equality_before(period, event_order, team):
+    """Igualdad numerica antes de una accion, restando rojas previas."""
+    rival = opponent_of(team)
+    previous_reds = red_cards[
+        (red_cards["period"] < period)
+        | ((red_cards["period"] == period) & (red_cards["event_order"] < event_order))
+    ]
+
+    team_players = 11 - int((previous_reds["team"] == team).sum())
+    rival_players = 11 - int((previous_reds["team"] == rival).sum())
+    return team_players == rival_players, team_players, rival_players
+
+
+rows = []
+for _, action in actions_leading_to_shot.iterrows():
+    recovery_team = action["team"]
+
+    # Si este equipo recupera, asumimos que el rival es el equipo que acaba de perder el balon.
+    losing_team = opponent_of(recovery_team)
+
+    period = int(action["period"])
+    event_order = float(action["event_order"])
+
+    score_state, score_diff = score_state_before(period, event_order, losing_team)
+    is_equal, losing_players, recovering_players = numerical_equality_before(period, event_order, losing_team)
+
+    rows.append({
+        "action_minute": round(float(action["minute"]) + float(action["second"]) / 60, 2),
+        "recovery_team": recovery_team,
+        "ball_losing_team": losing_team,
+        "losing_team_score_state": score_state,
+        "losing_team_score_diff": score_diff,
+        "is_numerical_equality": is_equal,
+        "ball_losing_team_players": losing_players,
+        "recovering_team_players": recovering_players,
+    })
+
+context = pd.DataFrame(rows)
+actions_enriched = pd.concat([actions_leading_to_shot.reset_index(drop=True), context], axis=1)
+
+actions_enriched.head()
+```
+
+## 6. Dataframe final
+
+Este es el dataframe limpio para explorar ubicaciones y contexto.
+
+```{python}
+result_cols = [
+    "match_id", "period", "minute", "second", "action_minute", "event_order",
+    "recovery_team", "ball_losing_team", "losing_team_score_state", "losing_team_score_diff",
+    "is_numerical_equality", "ball_losing_team_players", "recovering_team_players",
+    "player", "recovery_action_type", "possession", "x", "y", "play_pattern", "ends_in_shot",
+]
+
+recovery_locations_shot = actions_enriched[[c for c in result_cols if c in actions_enriched.columns]].copy()
+
+print(f"Filas finales: {len(recovery_locations_shot):,}")
+recovery_locations_shot
+```
+
+## 7. Comprobación rápida
+
+Mostramos los tiros de las posesiones incluidas para comprobar que realmente acababan en tiro.
+
+```{python}
+shot_check = recovery_locations_shot[["match_id", "possession", "recovery_team"]].drop_duplicates().merge(
+    shots[["match_id", "possession", "team", "minute", "second", "player", "shot_outcome", "shot_statsbomb_xg"]],
+    left_on=["match_id", "possession", "recovery_team"],
+    right_on=["match_id", "possession", "team"],
+    how="left",
+)
+
+shot_check.drop(columns=["team"]).sort_values(["possession", "minute", "second"]).reset_index(drop=True)
+```
+
+## 8. Resumen simple
+
+```{python}
+summary = (
+    recovery_locations_shot
+    .groupby(["recovery_team", "ball_losing_team", "losing_team_score_state", "is_numerical_equality"], dropna=False)
+    .agg(actions_leading_to_shot=("match_id", "count"))
+    .reset_index()
+    .sort_values("actions_leading_to_shot", ascending=False)
+)
+
+summary
+```
+
