@@ -85,9 +85,13 @@ COLS_NEEDED = [
     "location", "out", "under_pressure", "counterpress",
     "shot_outcome", "shot_statsbomb_xg",
     "ball_recovery_recovery_failure",
+    "ball_recovery_offensive",
+    "block_deflection", "block_offensive", "block_save_block",
     "interception_outcome",
     "duel_type", "duel_outcome",
-    "pass_outcome", "dribble_outcome", "ball_receipt_outcome",
+    "50_50_outcome",
+    "clearance_aerial_won", "clearance_body_part",
+    "pass_outcome", "pass_end_location", "dribble_outcome", "ball_receipt_outcome",
     "foul_committed_card", "bad_behaviour_card",
 ]
 
@@ -101,6 +105,14 @@ def get_x(value):
 
 
 def get_y(value):
+    return float(value[1]) if has_xy(value) else np.nan
+
+
+def get_end_x(value):
+    return float(value[0]) if has_xy(value) else np.nan
+
+
+def get_end_y(value):
     return float(value[1]) if has_xy(value) else np.nan
 
 
@@ -121,6 +133,8 @@ def prepare_events(raw_events):
     # Coordenadas StatsBomb: location = [x, y].
     events["x"] = events["location"].apply(get_x)
     events["y"] = events["location"].apply(get_y)
+    events["pass_end_x"] = events["pass_end_location"].apply(get_end_x)
+    events["pass_end_y"] = events["pass_end_location"].apply(get_end_y)
 
     events["period"] = pd.to_numeric(events["period"], errors="coerce").fillna(0).astype(int)
     events["minute"] = pd.to_numeric(events["minute"], errors="coerce")
@@ -198,7 +212,9 @@ Para cada cambio de posesion en juego abierto:
 2. `transition_team` es el `possession_team` de la siguiente posesion.
 3. Buscamos cerca del cambio una accion que explique la perdida.
 
-Priorizamos acciones defensivas del equipo que roba: `Block`, `Interception`, `Duel/Tackle`, `Ball Recovery`, `50/50`.
+Priorizamos acciones defensivas del equipo que roba: `Block`, `Interception`, `Duel/Tackle`, `50/50`, `Clearance`.
+
+Si no hay una accion defensiva dentro de la posesion que acaba, aceptamos un `Ball Recovery` solo cuando es el primer evento de la nueva posesion y la posesion anterior contiene una señal clara de perdida (`Ball Receipt* Incomplete`, `Miscontrol`, `Dispossessed`, `Pass Incomplete`, etc.). Asi capturamos balones sueltos sin usar ventanas arbitrarias.
 
 Si no encontramos accion defensiva clara, usamos la ultima accion de ataque del equipo que pierde: `Miscontrol`, `Dispossessed`, `Dribble`, `Pass`, etc.
 
@@ -208,7 +224,7 @@ DEFENSIVE_PRIORITY = {
     "Interception": 2,
     "Duel": 3,
     "50/50": 4,
-    "Ball Recovery": 5,
+    "Clearance": 5,
 }
 
 ATTACKING_PRIORITY = {
@@ -219,6 +235,14 @@ ATTACKING_PRIORITY = {
     "Carry": 5,
     "Ball Receipt*": 6,
 }
+
+VALID_TACKLE_OUTCOMES = {"Won", "Success", "Success In Play"}
+VALID_INTERCEPTION_OUTCOMES = {"Won", "Success", "In Play", "Success In Play"}
+VALID_50_50_OUTCOMES = {"Won", "Success To Team"}
+INCOMPLETE_PASS_OUTCOMES = {"Incomplete", "Out", "Pass Offside", "Unknown", "Injury Clearance"}
+INCOMPLETE_DRIBBLE_OUTCOMES = {"Incomplete"}
+INCOMPLETE_RECEIPT_OUTCOMES = {"Incomplete"}
+SHOT_END_TYPES = {"Shot", "Goal Keeper"}
 
 
 def mirror_x(x):
@@ -243,6 +267,16 @@ def is_restart_or_out(previous_events, next_possession):
 
     last_event = previous_events.sort_values("event_order").iloc[-1]
 
+    # Si la posesion anterior contiene un tiro, no es una perdida de las que
+    # queremos modelar. Es una posesion que ya termino atacando.
+    if (previous_events["type"] == "Shot").any():
+        return True
+
+    # Si acaba con accion de portero, tambien suele ser una continuacion natural
+    # tras tiro, parada, recepcion del portero o reinicio.
+    if str(last_event.get("type", "")) == "Goal Keeper":
+        return True
+
     if is_true(last_event.get("out", pd.NA)):
         return True
 
@@ -250,6 +284,104 @@ def is_restart_or_out(previous_events, next_possession):
         return True
 
     return False
+
+
+def has_attacking_loss_signal(event):
+    """True si el evento del equipo que ataca describe perdida o mal control."""
+    event_type = event.get("type")
+
+    if event_type in {"Miscontrol", "Dispossessed"}:
+        return True
+    if event_type == "Ball Receipt*":
+        return str(event.get("ball_receipt_outcome")) in INCOMPLETE_RECEIPT_OUTCOMES
+    if event_type == "Dribble":
+        return str(event.get("dribble_outcome")) in INCOMPLETE_DRIBBLE_OUTCOMES
+    if event_type == "Pass":
+        return str(event.get("pass_outcome")) in INCOMPLETE_PASS_OUTCOMES
+    if event_type == "Duel":
+        return "Lost" in str(event.get("duel_outcome"))
+    return False
+
+
+def attacking_loss_candidates(previous_events, losing_team):
+    """Eventos del equipo que pierde que explican la perdida."""
+    candidates = previous_events[
+        (previous_events["team"] == losing_team)
+        & (previous_events["type"].isin(ATTACKING_PRIORITY) | (previous_events["type"] == "Duel"))
+        & previous_events["x"].notna()
+        & previous_events["y"].notna()
+    ].copy()
+
+    if candidates.empty:
+        return candidates
+
+    candidates = candidates[candidates.apply(has_attacking_loss_signal, axis=1)].copy()
+    if candidates.empty:
+        return candidates
+
+    candidates["priority"] = candidates["type"].map(ATTACKING_PRIORITY).fillna(7)
+    return candidates
+
+
+def first_next_possession_recovery(events, next_possession, transition_team):
+    """Ball Recovery valido solo si abre la nueva posesion."""
+    next_events = events[
+        (events["period"] == int(next_possession["period"]))
+        & (events["possession"] == next_possession["possession"])
+    ].sort_values("event_order").copy()
+
+    if next_events.empty:
+        return pd.Series(dtype="object")
+
+    first_event = next_events.iloc[0]
+    if (
+        first_event.get("type") == "Ball Recovery"
+        and first_event.get("team") == transition_team
+        and pd.isna(first_event.get("ball_recovery_recovery_failure"))
+        and pd.notna(first_event.get("x"))
+        and pd.notna(first_event.get("y"))
+    ):
+        return first_event
+
+    return pd.Series(dtype="object")
+
+
+def event_location_for_loss(event):
+    """Punto fisico de perdida para el evento elegido.
+
+    Para un pase incompleto, preferimos el destino del pase si existe.
+    Para el resto usamos la localizacion del evento.
+    """
+    if event.get("type") == "Pass" and pd.notna(event.get("pass_end_x")) and pd.notna(event.get("pass_end_y")):
+        return float(event["pass_end_x"]), float(event["pass_end_y"])
+    return float(event["x"]), float(event["y"])
+
+
+def filter_valid_defensive_candidates(candidates):
+    """Evita meter duelos/intercepciones que no ganan realmente la pelota."""
+    if candidates.empty:
+        return candidates
+
+    valid = []
+    for _, event in candidates.iterrows():
+        event_type = event["type"]
+
+        if event_type == "Duel":
+            valid.append(
+                event.get("duel_type") == "Tackle"
+                and str(event.get("duel_outcome")) in VALID_TACKLE_OUTCOMES
+            )
+        elif event_type == "Interception":
+            valid.append(
+                str(event.get("interception_outcome")) in VALID_INTERCEPTION_OUTCOMES
+                or pd.isna(event.get("interception_outcome"))
+            )
+        elif event_type == "50/50":
+            valid.append(str(event.get("50_50_outcome")) in VALID_50_50_OUTCOMES)
+        else:
+            valid.append(True)
+
+    return candidates[pd.Series(valid, index=candidates.index)].copy()
 
 
 def choose_turnover_event(events, current_possession, next_possession):
@@ -264,42 +396,39 @@ def choose_turnover_event(events, current_possession, next_possession):
         & (events["possession"] == current_possession["possession"])
     ].copy()
 
-    # Eventos de la siguiente posesion, solo al comienzo.
-    next_start = float(next_possession["start_order"])
-    next_events_early = events[
-        (events["period"] == period)
-        & (events["possession"] == next_possession["possession"])
-        & (events["event_order"] <= next_start + 3)
-    ].copy()
-
-    # Primero buscamos acciones defensivas del equipo que transiciona.
-    defensive_candidates = pd.concat([previous_events, next_events_early], ignore_index=True)
+    # Primero buscamos acciones defensivas del equipo que transiciona, pero
+    # SOLO dentro de la posesion que pierde el rival.
+    defensive_candidates = previous_events.copy()
     defensive_candidates = defensive_candidates[
         (defensive_candidates["team"] == transition_team)
         & (defensive_candidates["type"].isin(DEFENSIVE_PRIORITY))
         & defensive_candidates["x"].notna()
         & defensive_candidates["y"].notna()
     ].copy()
+    defensive_candidates = filter_valid_defensive_candidates(defensive_candidates)
 
     if not defensive_candidates.empty:
         defensive_candidates["priority"] = defensive_candidates["type"].map(DEFENSIVE_PRIORITY)
         event = defensive_candidates.sort_values(["priority", "event_order"]).iloc[0]
         source = "defensive_event"
     else:
-        # Si no hay evento defensivo claro, usamos la ultima accion del equipo que pierde.
-        attacking_candidates = previous_events[
-            (previous_events["team"] == losing_team)
-            & (previous_events["type"].isin(ATTACKING_PRIORITY))
-            & previous_events["x"].notna()
-            & previous_events["y"].notna()
-        ].copy()
+        attacking_candidates = attacking_loss_candidates(previous_events, losing_team)
 
-        if attacking_candidates.empty:
+        # Ball Recovery entra solo si la posesion previa tiene una perdida clara
+        # y el Ball Recovery abre la nueva posesion.
+        next_recovery = first_next_possession_recovery(events, next_possession, transition_team)
+        if not attacking_candidates.empty and not next_recovery.empty:
+            event = next_recovery
+            source = "next_possession_recovery"
+        elif not attacking_candidates.empty:
+            # Si no hay recuperacion inicial, usamos la ultima señal de perdida
+            # del equipo que atacaba.
+            event = attacking_candidates.sort_values(["event_order", "priority"], ascending=[False, True]).iloc[0]
+            source = "attacking_event"
+        else:
             return None, previous_events
 
-        attacking_candidates["priority"] = attacking_candidates["type"].map(ATTACKING_PRIORITY)
-        event = attacking_candidates.sort_values(["event_order", "priority"]).iloc[-1]
-        source = "attacking_event"
+    event_x, event_y = event_location_for_loss(event)
 
     return {
         "turnover_event_source": source,
@@ -309,23 +438,38 @@ def choose_turnover_event(events, current_possession, next_possession):
         "turnover_event_team": event.get("team", pd.NA),
         "turnover_event_order": float(event["event_order"]),
         "turnover_event_seconds": float(event["event_seconds"]),
-        "turnover_x": float(event["x"]),
-        "turnover_y": float(event["y"]),
+        "turnover_x": event_x,
+        "turnover_y": event_y,
+        "raw_event_x": float(event["x"]),
+        "raw_event_y": float(event["y"]),
+        "pass_outcome": event.get("pass_outcome", pd.NA),
+        "dribble_outcome": event.get("dribble_outcome", pd.NA),
+        "ball_receipt_outcome": event.get("ball_receipt_outcome", pd.NA),
+        "duel_type": event.get("duel_type", pd.NA),
+        "duel_outcome": event.get("duel_outcome", pd.NA),
+        "interception_outcome": event.get("interception_outcome", pd.NA),
+        "50_50_outcome": event.get("50_50_outcome", pd.NA),
+        "clearance_aerial_won": event.get("clearance_aerial_won", pd.NA),
+        "clearance_body_part": event.get("clearance_body_part", pd.NA),
+        "ball_recovery_offensive": event.get("ball_recovery_offensive", pd.NA),
+        "block_deflection": event.get("block_deflection", pd.NA),
+        "block_offensive": event.get("block_offensive", pd.NA),
+        "block_save_block": event.get("block_save_block", pd.NA),
+        "under_pressure": event.get("under_pressure", pd.NA),
+        "counterpress": event.get("counterpress", pd.NA),
     }, previous_events
 ```
 
 ## 5. Construir dataset de perdidas
 
-`loss_x` y `loss_y` son la posicion vista desde el equipo que pierde el balon.
+Guardamos dos pares de coordenadas:
 
-Si el evento elegido lo hace el rival (`defensive_event`), convertimos coordenadas:
+- `loss_x`, `loss_y`: punto visto desde el equipo que pierde el balon. Son las variables principales para modelar riesgo de perdida.
+- `transition_x`, `transition_y`: el mismo punto visto desde el equipo que roba/transiciona. Sirven para debug y mapas desde el equipo que ataca despues.
 
-```python
-loss_x = 120 - turnover_x
-loss_y = 80 - turnover_y
-```
+Si el evento elegido lo hace el rival (`defensive_event` o `next_possession_recovery`), `turnover_x/y` ya estan en perspectiva del equipo que transiciona y los espejamos para obtener `loss_x/y`.
 
-Si el evento elegido lo hace el equipo que pierde (`attacking_event`), usamos sus `x, y` directamente.
+Si el evento elegido lo hace el equipo que pierde (`attacking_event`), `turnover_x/y` ya son `loss_x/y` y los espejamos para obtener `transition_x/y`.
 
 ```{python}
 def first_shot_after_turnover(events, transition_team, next_possession, t0_seconds, window_seconds=5):
@@ -396,18 +540,24 @@ for i in range(len(meta) - 1):
     if is_restart_or_out(previous_events, next_poss):
         continue
 
-    if turnover_event["turnover_event_source"] == "defensive_event":
+    if turnover_event["turnover_event_source"] in {"defensive_event", "next_possession_recovery"}:
         loss_x = mirror_x(turnover_event["turnover_x"])
         loss_y = mirror_y(turnover_event["turnover_y"])
+        transition_x = turnover_event["turnover_x"]
+        transition_y = turnover_event["turnover_y"]
     else:
         loss_x = turnover_event["turnover_x"]
         loss_y = turnover_event["turnover_y"]
+        transition_x = mirror_x(turnover_event["turnover_x"])
+        transition_y = mirror_y(turnover_event["turnover_y"])
 
     shot_info = first_shot_after_turnover(
         events=events,
         transition_team=transition_team,
         next_possession=next_poss,
-        t0_seconds=turnover_event["turnover_event_seconds"],
+        # La transicion empieza cuando arranca la nueva posesion del rival,
+        # no necesariamente en el evento defensivo que causo la perdida.
+        t0_seconds=float(next_poss["start_seconds"]),
         window_seconds=SHOT_WINDOW_SECONDS,
     )
 
@@ -420,10 +570,12 @@ for i in range(len(meta) - 1):
         "transition_possession": next_poss["possession"],
         "lost_possession_play_pattern": current_poss["play_pattern"],
         "transition_play_pattern": next_poss["play_pattern"],
-        "action_minute": round(turnover_event["turnover_event_seconds"] / 60, 2),
-        "event_seconds": turnover_event["turnover_event_seconds"],
+        "action_minute": round(float(next_poss["start_seconds"]) / 60, 2),
+        "event_seconds": float(next_poss["start_seconds"]),
         "loss_x": loss_x,
         "loss_y": loss_y,
+        "transition_x": transition_x,
+        "transition_y": transition_y,
         **turnover_event,
         **shot_info,
     })
@@ -510,9 +662,12 @@ for _, loss in loss_transition_events.iterrows():
     context_rows.append({
         "losing_team_score_state": score_state,
         "losing_team_score_diff": score_diff,
-        "is_numerical_equality": is_equal,
         "losing_team_players": losing_players,
         "transition_team_players": transition_players,
+        # Positivo: el equipo que roba/transiciona tiene mas jugadores.
+        # Negativo: el equipo que roba/transiciona tiene menos jugadores.
+        "transition_team_player_diff": transition_players - losing_players,
+        "is_numerical_equality": is_equal,
     })
 
 context = pd.DataFrame(context_rows)
@@ -525,18 +680,39 @@ model_dataset.head()
 
 `model_dataset` contiene todas las perdidas en juego y la variable objetivo `shot_within_5s`.
 
+Dejamos solo columnas razonables para empezar una regresion logistica. Evitamos meter demasiadas columnas de depuracion o texto crudo.
+
 `dangerous_losses_5s` contiene solo los positivos: perdidas que terminan en tiro rival en 5 segundos o menos.
 
 ```{python}
 model_cols = [
-    "match_id", "period", "action_minute", "event_seconds",
+    # Target
+    "shot_within_5s",
+
+    # Identificacion minima para revisar filas concretas.
+    "match_id", "period", "lost_possession", "transition_possession",
     "losing_team", "transition_team",
+
+    # Variables temporales y de marcador.
+    "action_minute",
     "losing_team_score_state", "losing_team_score_diff",
-    "is_numerical_equality", "losing_team_players", "transition_team_players",
-    "loss_x", "loss_y",
-    "turnover_action_type", "turnover_event_source", "turnover_player", "turnover_event_team",
-    "lost_possession", "transition_possession", "lost_possession_play_pattern", "transition_play_pattern",
-    "shot_within_5s", "seconds_to_shot", "shot_player", "shot_outcome", "shot_statsbomb_xg",
+
+    # Contexto numerico. Esta es mas informativa que solo igualdad numerica:
+    # +1 significa que el equipo que roba tiene un jugador mas; -2, dos menos.
+    "transition_team_player_diff",
+    "losing_team_players", "transition_team_players",
+
+    # Posicion de perdida desde el punto de vista del equipo que pierde.
+    "loss_x", "loss_y", "transition_x", "transition_y",
+
+    # Tipo de perdida/accion que origina la transicion.
+    "turnover_action_type", "turnover_event_source",
+
+    # Contexto directo del evento.
+    "under_pressure", "counterpress",
+
+    # Variables de resultado auxiliares para revisar positivos; no son predictors.
+    "seconds_to_shot", "shot_outcome", "shot_statsbomb_xg",
 ]
 
 model_dataset = model_dataset[[c for c in model_cols if c in model_dataset.columns]].copy()
@@ -567,10 +743,10 @@ display(
 print("Resumen por estado de marcador e igualdad numerica")
 display(
     model_dataset
-    .groupby(["losing_team_score_state", "is_numerical_equality"], dropna=False)
+    .groupby(["losing_team_score_state", "transition_team_player_diff"], dropna=False)
     .agg(perdidas=("match_id", "count"), tiros_5s=("shot_within_5s", "sum"))
     .assign(pct_tiro_5s=lambda d: (100 * d["tiros_5s"] / d["perdidas"]).round(1))
     .reset_index()
-    .sort_values(["losing_team_score_state", "is_numerical_equality"])
+    .sort_values(["losing_team_score_state", "transition_team_player_diff"])
 )
 ```
