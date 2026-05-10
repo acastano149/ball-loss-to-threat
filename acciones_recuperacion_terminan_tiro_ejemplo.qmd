@@ -1,5 +1,5 @@
 ---
-title: "Perdidas que generan tiro en 5 segundos"
+title: "Perdidas que generan tiro en una ventana configurable"
 subtitle: "Ejemplo sencillo con StatsBomb Open Data"
 format:
   html:
@@ -15,7 +15,7 @@ jupyter: python3
 
 # Perdidas que generan transicion y tiro
 
-Notebook sencillo para construir un dataset de regresion logistica.
+Notebook sencillo para construir datasets de modelado de perdidas y transiciones.
 
 La unidad de analisis ya no es una recuperacion aislada. Ahora es:
 
@@ -27,7 +27,7 @@ Para cada perdida guardamos:
 -   equipo que recupera/transiciona;
 -   posicion estimada de perdida;
 -   accion que explica la perdida (`Block`, `Interception`, `Duel`, `Miscontrol`, etc.);
--   si el rival tira en los siguientes 5 segundos;
+-   si el rival tira dentro de una ventana configurable;
 -   minuto, marcador e igualdad numerica.
 
 ```{python}
@@ -191,7 +191,7 @@ Una **recuperacion** se mira desde el rival que roba o recoge el balon.
 Para la regresion queremos una fila por perdida:
 
 ``` text
-equipo A ataca -> equipo A pierde -> equipo B transiciona -> equipo B tira o no tira en 5s
+equipo A ataca -> equipo A pierde -> equipo B transiciona -> equipo B tira o no tira dentro de la ventana
 ```
 
 Por eso partimos de cambios de posesion entre equipos, no de eventos sueltos.
@@ -512,7 +512,7 @@ def first_shot_after_turnover(events, transition_team, next_possession, t0_secon
 
     if shots.empty:
         return {
-            "shot_within_5s": 0,
+            "transition_shot_within_window": 0,
             "seconds_to_shot": np.nan,
             "shot_player": pd.NA,
             "shot_outcome": pd.NA,
@@ -527,7 +527,7 @@ def first_shot_after_turnover(events, transition_team, next_possession, t0_secon
 
     if shots.empty:
         return {
-            "shot_within_5s": 0,
+            "transition_shot_within_window": 0,
             "seconds_to_shot": np.nan,
             "shot_player": pd.NA,
             "shot_outcome": pd.NA,
@@ -536,7 +536,7 @@ def first_shot_after_turnover(events, transition_team, next_possession, t0_secon
 
     shot = shots.iloc[0]
     return {
-        "shot_within_5s": 1,
+        "transition_shot_within_window": 1,
         "seconds_to_shot": float(shot["seconds_to_shot"]),
         "shot_player": shot.get("player", pd.NA),
         "shot_outcome": shot.get("shot_outcome", pd.NA),
@@ -612,7 +612,7 @@ for i in range(len(meta) - 1):
 loss_transition_events = pd.DataFrame(rows)
 
 print(f"Perdidas en juego detectadas: {len(loss_transition_events):,}")
-print(f"Perdidas con tiro rival en <= {SHOT_WINDOW_SECONDS}s: {int(loss_transition_events['shot_within_5s'].sum()) if not loss_transition_events.empty else 0:,}")
+print(f"Perdidas con tiro rival en <= {SHOT_WINDOW_SECONDS}s: {int(loss_transition_events['transition_shot_within_window'].sum()) if not loss_transition_events.empty else 0:,}")
 loss_transition_events.head(20)
 ```
 
@@ -1024,62 +1024,81 @@ model_dataset[[
 
 ## 9. Dataframes finales
 
-`model_dataset` contiene todas las perdidas en juego y la variable objetivo `shot_within_5s`.
+`model_dataset` contiene todas las perdidas en juego y la variable objetivo `transition_shot_within_window`.
 
-Dejamos solo columnas razonables para empezar una regresion logistica. Evitamos meter demasiadas columnas de depuracion o texto crudo.
+Desde esa base generamos dos dataframes:
 
-`dangerous_losses_5s` contiene solo los positivos: perdidas que terminan en tiro rival en 5 segundos o menos.
+- `random_forest_dataset`: mas ancho, con mas variables candidatas y categoricas para que el bosque pueda seleccionar.
+- `logistic_regression_dataset`: mas compacto, con menos columnas y menos duplicidad entre variables.
+
+`dangerous_losses_window` contiene solo los positivos: perdidas que terminan en tiro rival dentro de la ventana configurable.
 
 ```{python}
-model_cols = [
-    # Target
-    "shot_within_5s",
+TARGET_COL = "transition_shot_within_window"
 
-    # Identificacion minima para revisar filas concretas.
-    "match_id", "period", "lost_possession", "transition_possession",
-    "losing_team", "transition_team",
-
-    # Variables temporales y de marcador.
+# Dataset amplio para Random Forest.
+# Excluimos variables de fuga como seconds_to_shot, shot_outcome o xG:
+# esas solo se conocen despues de saber que hubo tiro.
+random_forest_cols = [
+    TARGET_COL,
     "action_minute",
     "losing_team_score_state", "losing_team_score_diff",
-
-    # Contexto numerico. Esta es mas informativa que solo igualdad numerica:
-    # +1 significa que el equipo que roba tiene un jugador mas; -2, dos menos.
     "transition_team_player_diff",
     "losing_team_players", "transition_team_players",
-
-    # Posicion de perdida desde el punto de vista del equipo que pierde.
-    "loss_x", "loss_y", "transition_x", "transition_y",
-
-    # Tipo de perdida/accion que origina la transicion.
+    "loss_x", "loss_y",
     "turnover_action_type", "turnover_event_source",
-
-    # Contexto directo del evento.
+    "lost_possession_play_pattern", "transition_play_pattern",
     "under_pressure", "counterpress",
-
-    # Variables del área de acción inmediata (requieren datos 360).
+    "losing_team", "transition_team",
     "zone_losing_players", "zone_transition_players", "zone_player_diff",
     "nearest_defender_dist_m", "defenders_goalside_in_zone",
-
-    # Variables de la última línea defensiva (requieren datos 360).
     "last_def_dist_to_goal_m",
     "last_line_losing_players", "last_line_transition_players", "last_line_player_diff",
     "last_line_def_area_ratio", "last_line_avg_marking_dist_m",
-
-    # Variables de resultado auxiliares para revisar positivos; no son predictors.
-    "seconds_to_shot", "shot_outcome", "shot_statsbomb_xg",
 ]
 
-model_dataset = model_dataset[[c for c in model_cols if c in model_dataset.columns]].copy()
-dangerous_losses_5s = (
-    model_dataset[model_dataset["shot_within_5s"] == 1]
+# Dataset compacto para regresion logistica.
+# En numerica nos quedamos con transition_team_player_diff, no con los conteos duplicados.
+# En posicion nos quedamos con loss_x/loss_y, no con transition_x/transition_y.
+logistic_regression_cols = [
+    TARGET_COL,
+    "action_minute",
+    "losing_team_score_diff",
+    "transition_team_player_diff",
+    "loss_x", "loss_y",
+    "turnover_action_type", "turnover_event_source",
+    "under_pressure", "counterpress",
+    "zone_player_diff", "nearest_defender_dist_m", "defenders_goalside_in_zone",
+    "last_def_dist_to_goal_m", "last_line_player_diff",
+    "last_line_def_area_ratio", "last_line_avg_marking_dist_m",
+]
+
+review_cols = [
+    "match_id", "period", "lost_possession", "transition_possession",
+    "losing_team", "transition_team",
+    "action_minute", "loss_x", "loss_y", "transition_x", "transition_y",
+    "turnover_action_type", "turnover_event_source",
+    TARGET_COL, "seconds_to_shot", "shot_player", "shot_outcome", "shot_statsbomb_xg",
+]
+
+random_forest_dataset = model_dataset[[c for c in random_forest_cols if c in model_dataset.columns]].copy()
+logistic_regression_dataset = model_dataset[[c for c in logistic_regression_cols if c in model_dataset.columns]].copy()
+
+dangerous_losses_window = (
+    model_dataset[model_dataset[TARGET_COL] == 1]
+    [[c for c in review_cols if c in model_dataset.columns]]
     .copy()
     .reset_index(drop=True)
 )
 
-print(f"Filas para regresion logistica: {len(model_dataset):,}")
-print(f"Positivos con tiro rival en <= {SHOT_WINDOW_SECONDS}s: {len(dangerous_losses_5s):,}")
-dangerous_losses_5s
+print(f"Filas base: {len(model_dataset):,}")
+print(f"Columnas Random Forest: {len(random_forest_dataset.columns)}")
+print(f"Columnas regresion logistica: {len(logistic_regression_dataset.columns)}")
+print(f"Positivos con tiro rival en <= {SHOT_WINDOW_SECONDS}s: {len(dangerous_losses_window):,}")
+
+display(random_forest_dataset.head())
+display(logistic_regression_dataset.head())
+dangerous_losses_window
 ```
 
 ## 10. Comprobaciones rapidas
@@ -1089,18 +1108,18 @@ print("Tipos de perdida detectados")
 display(
     model_dataset
     .groupby(["turnover_action_type", "turnover_event_source"], dropna=False)
-    .agg(perdidas=("match_id", "count"), tiros_5s=("shot_within_5s", "sum"))
-    .assign(pct_tiro_5s=lambda d: (100 * d["tiros_5s"] / d["perdidas"]).round(1))
+    .agg(perdidas=("match_id", "count"), tiros_en_ventana=(TARGET_COL, "sum"))
+    .assign(pct_tiro_en_ventana=lambda d: (100 * d["tiros_en_ventana"] / d["perdidas"]).round(1))
     .reset_index()
     .sort_values("perdidas", ascending=False)
 )
 
-print("Resumen por estado de marcador e igualdad numerica")
+print(f"Resumen por estado de marcador y diferencia numerica; tiro rival en <= {SHOT_WINDOW_SECONDS}s")
 display(
     model_dataset
     .groupby(["losing_team_score_state", "transition_team_player_diff"], dropna=False)
-    .agg(perdidas=("match_id", "count"), tiros_5s=("shot_within_5s", "sum"))
-    .assign(pct_tiro_5s=lambda d: (100 * d["tiros_5s"] / d["perdidas"]).round(1))
+    .agg(perdidas=("match_id", "count"), tiros_en_ventana=(TARGET_COL, "sum"))
+    .assign(pct_tiro_en_ventana=lambda d: (100 * d["tiros_en_ventana"] / d["perdidas"]).round(1))
     .reset_index()
     .sort_values(["losing_team_score_state", "transition_team_player_diff"])
 )
