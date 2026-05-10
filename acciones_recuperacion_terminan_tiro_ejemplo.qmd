@@ -23,12 +23,26 @@ La unidad de analisis ya no es una recuperacion aislada. Ahora es:
 
 Para cada perdida guardamos:
 
-- equipo que pierde el balon;
-- equipo que recupera/transiciona;
-- posicion estimada de perdida;
-- accion que explica la perdida (`Block`, `Interception`, `Duel`, `Miscontrol`, etc.);
-- si el rival tira en los siguientes 5 segundos;
-- minuto, marcador e igualdad numerica.
+-   equipo que pierde el balon;
+-   equipo que recupera/transiciona;
+-   posicion estimada de perdida;
+-   accion que explica la perdida (`Block`, `Interception`, `Duel`, `Miscontrol`, etc.);
+-   si el rival tira en los siguientes 5 segundos;
+-   minuto, marcador e igualdad numerica.
+
+```{python}
+# Instala las dependencias necesarias si no están disponibles en el entorno.
+# · scipy  viene habitualmente en distribuciones científicas (Anaconda, etc.)
+# · shapely es necesaria para el clipping de polígonos Voronoi (sección 8)
+import importlib, subprocess, sys
+
+for _pkg in ["scipy", "shapely"]:
+    if importlib.util.find_spec(_pkg) is None:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", _pkg])
+        print(f"✓ Instalado: {_pkg}")
+    else:
+        print(f"✓ Ya disponible: {_pkg}")
+```
 
 ```{python}
 import warnings
@@ -149,6 +163,21 @@ def prepare_events(raw_events):
 raw_events = sb.events(match_id=MATCH_ID)
 events = prepare_events(raw_events)
 
+# Datos 360: archivo complementario con fotogramas de posiciones de jugadores.
+# statsbombpy los expone a través de sb.frames(), que devuelve UNA FILA POR JUGADOR
+# y renombra event_uuid → id. Reagrupamos por id para reconstruir la lista de
+# jugadores por evento, que es el formato que necesita zone_variables().
+try:
+    _frames = sb.frames(match_id=MATCH_ID)
+    freeze_lookup = {
+        event_id: grp[["teammate", "actor", "keeper", "location"]].to_dict("records")
+        for event_id, grp in _frames.groupby("id")
+    }
+    print(f"Eventos con fotograma 360: {len(freeze_lookup):,}")
+except Exception as _exc:
+    print(f"⚠ Sin datos 360 para este partido ({_exc}). Variables de zona → NaN.")
+    freeze_lookup = {}
+
 print(f"Eventos cargados: {len(events):,}")
 events.head()
 ```
@@ -161,7 +190,7 @@ Una **recuperacion** se mira desde el rival que roba o recoge el balon.
 
 Para la regresion queremos una fila por perdida:
 
-```text
+``` text
 equipo A ataca -> equipo A pierde -> equipo B transiciona -> equipo B tira o no tira en 5s
 ```
 
@@ -169,7 +198,7 @@ Por eso partimos de cambios de posesion entre equipos, no de eventos sueltos.
 
 ```{python}
 OPEN_PLAY_NEXT_PATTERNS = {"Regular Play", "From Counter"}
-SHOT_WINDOW_SECONDS = 5
+SHOT_WINDOW_SECONDS = 10
 
 
 def is_true(value):
@@ -208,9 +237,9 @@ meta.head(10)
 
 Para cada cambio de posesion en juego abierto:
 
-1. `losing_team` es el `possession_team` de la posesion que acaba.
-2. `transition_team` es el `possession_team` de la siguiente posesion.
-3. Buscamos cerca del cambio una accion que explique la perdida.
+1.  `losing_team` es el `possession_team` de la posesion que acaba.
+2.  `transition_team` es el `possession_team` de la siguiente posesion.
+3.  Buscamos cerca del cambio una accion que explique la perdida.
 
 Priorizamos acciones defensivas del equipo que roba: `Block`, `Interception`, `Duel/Tackle`, `50/50`, `Clearance`.
 
@@ -464,15 +493,15 @@ def choose_turnover_event(events, current_possession, next_possession):
 
 Guardamos dos pares de coordenadas:
 
-- `loss_x`, `loss_y`: punto visto desde el equipo que pierde el balon. Son las variables principales para modelar riesgo de perdida.
-- `transition_x`, `transition_y`: el mismo punto visto desde el equipo que roba/transiciona. Sirven para debug y mapas desde el equipo que ataca despues.
+-   `loss_x`, `loss_y`: punto visto desde el equipo que pierde el balon. Son las variables principales para modelar riesgo de perdida.
+-   `transition_x`, `transition_y`: el mismo punto visto desde el equipo que roba/transiciona. Sirven para debug y mapas desde el equipo que ataca despues.
 
 Si el evento elegido lo hace el rival (`defensive_event` o `next_possession_recovery`), `turnover_x/y` ya estan en perspectiva del equipo que transiciona y los espejamos para obtener `loss_x/y`.
 
 Si el evento elegido lo hace el equipo que pierde (`attacking_event`), `turnover_x/y` ya son `loss_x/y` y los espejamos para obtener `transition_x/y`.
 
 ```{python}
-def first_shot_after_turnover(events, transition_team, next_possession, t0_seconds, window_seconds=5):
+def first_shot_after_turnover(events, transition_team, next_possession, t0_seconds, window_seconds=10):
     """Primer tiro del equipo que transiciona en su siguiente posesion y dentro de la ventana."""
     shots = events[
         (events["period"] == int(next_possession["period"]))
@@ -676,7 +705,324 @@ model_dataset = pd.concat([loss_transition_events.reset_index(drop=True), contex
 model_dataset.head()
 ```
 
-## 7. Dataframes finales
+## 7. Variables del área de acción inmediata
+
+Para cada pérdida calculamos, en un radio configurable alrededor del punto de pérdida, indicadores de superioridad local que la literatura de *football analytics* asocia con el riesgo de transición peligrosa.
+
+Las posiciones de los jugadores provienen de los datos **StatsBomb 360** cargados en la sección 2 (`freeze_lookup`). statsbombpy los expone a través de `sb.frames()`, que devuelve una fila por jugador y usa `id` como clave de evento (equivale al `id` de los eventos). En la sección 2 reagrupamos por `id` para reconstruir la lista de jugadores por evento. Las coordenadas se normalizan al mismo sistema que `loss_x`/`loss_y` (el equipo que pierde siempre ataca hacia *x* alto; su portería está en (0, 40)).
+
+> **Disponibilidad de datos 360**: disponibles para Bundesliga 2023/24 y otras competiciones del open data. Si para alguna competición no existiese el fichero, la sección 2 asigna `freeze_lookup = {}` y las variables de zona quedarán como `NaN`.
+
+Variables calculadas:
+
+-   `zone_losing_players` / `zone_transition_players`: número de jugadores de cada equipo dentro del radio.
+-   `zone_player_diff`: `losing − transition` (positivo = el equipo que pierde tiene más defensores en la zona).
+-   `nearest_defender_dist_m`: distancia en metros del defensor más cercano al poseedor del balón.
+-   `defenders_goalside_in_zone`: defensores de la zona cuya distancia al centro de la portería propia es menor que la del poseedor del balón.
+
+```{python}
+# ── Parámetros del área de acción (modificar aquí) ────────────────────────
+RADIUS_METERS = 10.0        # Radio en metros
+
+# Dimensiones reales del campo y escala StatsBomb (campo estándar 105 m × 68 m)
+PITCH_LENGTH_M = 105.0
+PITCH_WIDTH_M  =  68.0
+SB_LENGTH      = 120.0
+SB_WIDTH       =  80.0
+
+# Portería propia en el sistema normalizado del equipo que pierde
+OWN_GOAL_X = 0.0
+OWN_GOAL_Y = 40.0
+
+
+def dist_m(x1, y1, x2, y2):
+    """Distancia euclidea en metros entre dos puntos en coordenadas StatsBomb."""
+    dx = (x2 - x1) * (PITCH_LENGTH_M / SB_LENGTH)
+    dy = (y2 - y1) * (PITCH_WIDTH_M  / SB_WIDTH)
+    return float(np.sqrt(dx**2 + dy**2))
+
+
+_NAN_ZONE = {
+    "zone_losing_players":        np.nan,
+    "zone_transition_players":    np.nan,
+    "zone_player_diff":           np.nan,
+    "nearest_defender_dist_m":    np.nan,
+    "defenders_goalside_in_zone": np.nan,
+}
+
+
+def zone_variables(row):
+    """Calcula las 5 variables del área de acción inmediata para una pérdida."""
+    frame = freeze_lookup.get(row.get("turnover_event_id"))
+    if not frame:
+        return _NAN_ZONE.copy()
+
+    ball_x      = row["loss_x"]
+    ball_y      = row["loss_y"]
+    source      = row["turnover_event_source"]
+    need_mirror = source in {"defensive_event", "next_possession_recovery"}
+
+    players = []
+    for p in frame:
+        loc = p.get("location", [np.nan, np.nan])
+        px, py   = float(loc[0]), float(loc[1])
+        if need_mirror:
+            px, py = mirror_x(px), mirror_y(py)
+
+        teammate = bool(p.get("teammate", False))
+        actor    = bool(p.get("actor",    False))
+
+        # Asignación de equipo en el sistema normalizado del losing_team.
+        # Para defensive_event/next_possession_recovery el actor es transition_team;
+        # para attacking_event el actor es losing_team.
+        if source in {"defensive_event", "next_possession_recovery"}:
+            is_losing = not (teammate or actor)
+        else:
+            is_losing = teammate or actor
+
+        players.append({
+            "x": px, "y": py,
+            "is_losing":    is_losing,
+            "dist_to_ball": dist_m(px, py, ball_x, ball_y),
+        })
+
+    in_zone         = [p for p in players if p["dist_to_ball"] <= RADIUS_METERS]
+    zone_losing     = sum(1 for p in in_zone if     p["is_losing"])
+    zone_transition = sum(1 for p in in_zone if not p["is_losing"])
+
+    losing_in_zone = [p for p in in_zone if p["is_losing"]]
+    nearest_dist   = min((p["dist_to_ball"] for p in losing_in_zone), default=np.nan)
+
+    d_ball_goal    = dist_m(ball_x, ball_y, OWN_GOAL_X, OWN_GOAL_Y)
+    goalside_count = sum(
+        1 for p in losing_in_zone
+        if dist_m(p["x"], p["y"], OWN_GOAL_X, OWN_GOAL_Y) < d_ball_goal
+    )
+
+    return {
+        "zone_losing_players":        zone_losing,
+        "zone_transition_players":    zone_transition,
+        "zone_player_diff":           zone_losing - zone_transition,
+        "nearest_defender_dist_m":    nearest_dist,
+        "defenders_goalside_in_zone": goalside_count,
+    }
+
+
+zone_df       = model_dataset.apply(zone_variables, axis=1, result_type="expand")
+model_dataset = pd.concat(
+    [model_dataset.reset_index(drop=True), zone_df.reset_index(drop=True)], axis=1
+)
+
+cobertura = zone_df["zone_losing_players"].notna().sum()
+print(f"Pérdidas con datos 360: {cobertura:,} / {len(model_dataset):,}")
+model_dataset[[
+    "loss_x", "loss_y",
+    "zone_losing_players", "zone_transition_players", "zone_player_diff",
+    "nearest_defender_dist_m", "defenders_goalside_in_zone",
+]].head(10)
+```
+
+## 8. Variables de la última línea defensiva
+
+La **vigilancia ofensiva** mide en qué medida la última línea defensiva puede controlar el espacio más peligroso en el momento de la pérdida: el rectángulo inmediatamente delante de los últimos defensores, desde el que un atacante puede progresar hacia portería sin encontrar oposición.
+
+### Definición de la zona
+
+Partiendo del fotograma 360, localizamos al **último defensor de campo** del equipo que pierde (el jugador con menor *x* en el sistema normalizado, excluyendo el portero). Su coordenada *x* marca el borde interior de la zona. Desde ahí, la zona se extiende `LAST_LINE_DEPTH_METERS` metros en dirección *x* creciente (hacia el campo del equipo atacante), con todo el ancho del campo en *y*.
+
+### Variables calculadas
+
+**a) `last_def_dist_to_goal_m`** Distancia en metros del último defensor de campo al centro de la portería propia (0, 40). Mide la profundidad de la línea: cuanto mayor, más espacio hay a explotar a sus espaldas.
+
+**b) `last_line_losing_players` / `last_line_transition_players`** Número de jugadores de cada equipo dentro de la zona de última línea. El portero se excluye del conteo defensor; todos los atacantes visibles se incluyen.
+
+**c) `last_line_player_diff`** `losing − transition`. Positivo: el equipo que defiende la transición tiene más jugadores en la zona. Negativo: está en inferioridad numérica en ese espacio crítico.
+
+**d.1) `last_line_def_area_ratio` — Control territorial (Voronoi)** Se construye un diagrama de Voronoi usando **todos** los jugadores visibles del fotograma (no solo los de la zona). Usar todos los jugadores evita los artefactos de borde que ocurren cuando hay pocos jugadores en la zona: las celdas se extienden correctamente hasta los límites del campo gracias al *reflection trick* (cada punto se refleja en las cuatro líneas del campo antes de calcular Voronoi, técnica popularizada por Dan Nichol). Las celdas resultantes se recortan al rectángulo de la última línea con `shapely`. El ratio *área defensores / área total* expresa qué fracción del espacio crítico controla el equipo que defiende: `1.0` = control total, `0.0` = espacio completamente libre para el rival.
+
+**d.2) `last_line_avg_marking_dist_m` — Presión de marcaje** Para cada atacante dentro de la zona, se calcula la distancia al defensor visible más cercano (buscando en todo el campo, no solo en la zona). El promedio de estas distancias captura si los atacantes en la zona están bien marcados o tienen libertad de movimiento. Complementa el ratio Voronoi: puede haber equilibrio territorial pero con atacantes alejados de sus marcadores, lo que aumenta el peligro real de la transición.
+
+```{python}
+# ── Parámetros de la última línea (modificar aquí) ────────────────────────
+LAST_LINE_DEPTH_METERS = 10.0   # Profundidad de la zona en metros
+
+LAST_LINE_DEPTH_SB = LAST_LINE_DEPTH_METERS * (SB_LENGTH / PITCH_LENGTH_M)
+
+from scipy.spatial import Voronoi as _Voronoi
+from shapely.geometry import Polygon as _Polygon
+from shapely.errors import GEOSException
+
+
+def _reflect_2d(pts):
+    """Reflection trick: refleja puntos en los 4 bordes del campo para Voronoi."""
+    x0, x1, y0, y1 = 0.0, SB_LENGTH, 0.0, SB_WIDTH
+    return np.vstack([
+        pts,
+        np.column_stack([2*x0 - pts[:, 0], pts[:, 1]]),
+        np.column_stack([2*x1 - pts[:, 0], pts[:, 1]]),
+        np.column_stack([pts[:, 0], 2*y0 - pts[:, 1]]),
+        np.column_stack([pts[:, 0], 2*y1 - pts[:, 1]]),
+    ])
+
+
+def _voronoi_area_ratio(players, zone_poly):
+    """
+    Fracción del área de zone_poly controlada por el equipo que pierde (losing_team).
+    Tesela con todos los jugadores visibles para evitar artefactos de borde.
+    """
+    if len(players) < 2:
+        return np.nan
+
+    coords    = np.array([[p["x"], p["y"]] for p in players])
+    is_losing = np.array([p["is_losing"] for p in players])
+    n         = len(players)
+
+    try:
+        vor = _Voronoi(_reflect_2d(coords))
+    except Exception:
+        return np.nan
+
+    def_area   = 0.0
+    total_area = 0.0
+
+    for i in range(n):
+        region = vor.regions[vor.point_region[i]]
+        if -1 in region or len(region) < 3:
+            continue
+        try:
+            poly    = _Polygon(vor.vertices[region])
+            clipped = poly.intersection(zone_poly)
+            if not clipped.is_valid or clipped.is_empty:
+                continue
+            area = clipped.area
+            if is_losing[i]:
+                def_area += area
+            total_area += area
+        except (GEOSException, Exception):
+            continue
+
+    return def_area / total_area if total_area > 0 else np.nan
+
+
+_NAN_LL = {
+    "last_def_dist_to_goal_m":      np.nan,
+    "last_line_losing_players":     np.nan,
+    "last_line_transition_players": np.nan,
+    "last_line_player_diff":        np.nan,
+    "last_line_def_area_ratio":     np.nan,
+    "last_line_avg_marking_dist_m": np.nan,
+}
+
+
+def last_line_variables(row):
+    """Calcula las 6 variables de la última línea defensiva para una pérdida."""
+    frame = freeze_lookup.get(row.get("turnover_event_id"))
+    if not frame:
+        return _NAN_LL.copy()
+
+    source      = row["turnover_event_source"]
+    need_mirror = source in {"defensive_event", "next_possession_recovery"}
+
+    players = []
+    for p in frame:
+        loc = p.get("location", [np.nan, np.nan])
+        px, py = float(loc[0]), float(loc[1])
+        if need_mirror:
+            px, py = mirror_x(px), mirror_y(py)
+        if not (np.isfinite(px) and np.isfinite(py)):
+            continue
+
+        teammate = bool(p.get("teammate", False))
+        actor    = bool(p.get("actor",    False))
+        keeper   = bool(p.get("keeper",   False))
+
+        if source in {"defensive_event", "next_possession_recovery"}:
+            is_losing = not (teammate or actor)
+        else:
+            is_losing = teammate or actor
+
+        players.append({
+            "x": px, "y": py,
+            "is_losing": is_losing,
+            "keeper":    keeper,
+        })
+
+    # Último defensor de campo (excluir portero)
+    outfield_defenders = [p for p in players if p["is_losing"] and not p["keeper"]]
+    if not outfield_defenders:
+        return _NAN_LL.copy()
+
+    last_def   = min(outfield_defenders, key=lambda p: p["x"])
+    last_def_x = last_def["x"]
+
+    # a) Distancia último defensor → portería propia
+    last_def_dist_goal = dist_m(last_def["x"], last_def["y"], OWN_GOAL_X, OWN_GOAL_Y)
+
+    # Zona: [last_def_x, last_def_x + LAST_LINE_DEPTH_SB] × [0, SB_WIDTH]
+    zone_x_max = min(last_def_x + LAST_LINE_DEPTH_SB, SB_LENGTH)
+    zone_poly  = _Polygon([
+        (last_def_x, 0),
+        (zone_x_max, 0),
+        (zone_x_max, SB_WIDTH),
+        (last_def_x, SB_WIDTH),
+    ])
+
+    # b) Jugadores en zona (porteros excluidos del lado defensor)
+    in_zone_losing     = [
+        p for p in players
+        if p["is_losing"] and not p["keeper"]
+        and last_def_x <= p["x"] <= zone_x_max
+    ]
+    in_zone_transition = [
+        p for p in players
+        if not p["is_losing"]
+        and last_def_x <= p["x"] <= zone_x_max
+    ]
+
+    # d.1) Voronoi con todos los jugadores (excl. porteros), clipeado a zona
+    players_for_vor = [p for p in players if not p["keeper"]]
+    def_area_ratio  = _voronoi_area_ratio(players_for_vor, zone_poly)
+
+    # d.2) Distancia media de marcaje para atacantes en zona
+    if in_zone_transition:
+        defenders_all = [p for p in players if p["is_losing"] and not p["keeper"]]
+        if defenders_all:
+            marking_dists = [
+                min(dist_m(att["x"], att["y"], d["x"], d["y"]) for d in defenders_all)
+                for att in in_zone_transition
+            ]
+            avg_marking = float(np.mean(marking_dists))
+        else:
+            avg_marking = np.nan
+    else:
+        avg_marking = np.nan
+
+    return {
+        "last_def_dist_to_goal_m":      last_def_dist_goal,
+        "last_line_losing_players":     len(in_zone_losing),
+        "last_line_transition_players": len(in_zone_transition),
+        "last_line_player_diff":        len(in_zone_losing) - len(in_zone_transition),
+        "last_line_def_area_ratio":     def_area_ratio,
+        "last_line_avg_marking_dist_m": avg_marking,
+    }
+
+
+ll_df         = model_dataset.apply(last_line_variables, axis=1, result_type="expand")
+model_dataset = pd.concat(
+    [model_dataset.reset_index(drop=True), ll_df.reset_index(drop=True)], axis=1
+)
+
+cobertura_ll = ll_df["last_def_dist_to_goal_m"].notna().sum()
+print(f"Pérdidas con datos de última línea: {cobertura_ll:,} / {len(model_dataset):,}")
+model_dataset[[
+    "loss_x", "loss_y",
+    "last_def_dist_to_goal_m",
+    "last_line_losing_players", "last_line_transition_players", "last_line_player_diff",
+    "last_line_def_area_ratio", "last_line_avg_marking_dist_m",
+]].head(10)
+```
+
+## 9. Dataframes finales
 
 `model_dataset` contiene todas las perdidas en juego y la variable objetivo `shot_within_5s`.
 
@@ -711,6 +1057,15 @@ model_cols = [
     # Contexto directo del evento.
     "under_pressure", "counterpress",
 
+    # Variables del área de acción inmediata (requieren datos 360).
+    "zone_losing_players", "zone_transition_players", "zone_player_diff",
+    "nearest_defender_dist_m", "defenders_goalside_in_zone",
+
+    # Variables de la última línea defensiva (requieren datos 360).
+    "last_def_dist_to_goal_m",
+    "last_line_losing_players", "last_line_transition_players", "last_line_player_diff",
+    "last_line_def_area_ratio", "last_line_avg_marking_dist_m",
+
     # Variables de resultado auxiliares para revisar positivos; no son predictors.
     "seconds_to_shot", "shot_outcome", "shot_statsbomb_xg",
 ]
@@ -727,7 +1082,7 @@ print(f"Positivos con tiro rival en <= {SHOT_WINDOW_SECONDS}s: {len(dangerous_lo
 dangerous_losses_5s
 ```
 
-## 8. Comprobaciones rapidas
+## 10. Comprobaciones rapidas
 
 ```{python}
 print("Tipos de perdida detectados")
