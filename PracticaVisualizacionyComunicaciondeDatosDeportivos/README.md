@@ -105,8 +105,6 @@ La aplicación está desplegada en ShinyApps.io:
 
 https://99f1p5-acastano149.shinyapps.io/ball-loss-to-threat/
 
-También se conserva la configuración de despliegue en `rsconnect-python/shiny.json`.
-
 ## Ejecución local
 
 Instalar dependencias:
@@ -128,7 +126,6 @@ PracticaVisualizacionyComunicaciondeDatosDeportivos/
 - app.py
 - requirements.txt
 - README.md
-- rsconnect-python/shiny.json
 - .gitignore
 ```
 
