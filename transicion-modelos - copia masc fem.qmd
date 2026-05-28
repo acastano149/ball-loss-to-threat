@@ -1,0 +1,3723 @@
+---
+title: "Análisis de transiciones defensivas en fútbol profesional"
+subtitle: "¿Podemos detectar pérdidas peligrosas al momento de pérdida?"
+lang: es
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-title: "Contenido"
+    toc-location: left
+    toc-depth: 3
+    toc-expand: 2
+    number-sections: false
+    smooth-scroll: true
+
+    page-layout: full
+    grid:
+      body-width: 1100px
+      margin-width: 260px
+      sidebar-width: 260px
+      gutter-width: 1.5rem
+
+    code-tools: true
+    code-fold: true
+    code-summary: "Mostrar código"
+    code-overflow: wrap
+
+    fig-responsive: true
+    embed-resources: true
+    link-external-newwindow: true
+    css: styles.css
+
+execute:
+  warning: false
+  message: false
+  echo: true
+
+jupyter: python3
+---
+
+# Pérdidas que generan transición y tiro
+
+## Contexto y objetivo del trabajo
+
+Este trabajo se centra en las **transiciones defensivas**: las situaciones en las que un equipo pierde el balón y debe reorganizarse de forma inmediata para evitar que la nueva posesión rival se convierta en una ocasión de tiro. En este tipo de acciones, la calidad de la respuesta no depende solo del evento que provoca la pérdida, sino también de la estructura colectiva que existía antes de perder, de la cercanía de los defensores al balón, de la protección de los espacios interiores y de la preparación de la última línea.
+
+El objetivo es construir un conjunto de datos que permita evaluar qué factores están asociados con la efectividad de esa transición defensiva. Para ello, cada observación representa una pérdida en juego abierto que da paso a una posesión rival. La variable objetivo indica si el equipo que recupera consigue finalizar con un tiro dentro de una ventana temporal configurable (`SHOT_WINDOW_SECONDS`). Así, el problema queda formulado como una estimación del riesgo: dadas las condiciones espaciales, numéricas y contextuales de la pérdida, ¿qué probabilidad existe de que el rival genere un tiro?
+
+La unidad de análisis ya no es una recuperación aislada. Ahora es:
+
+> una posesión de un equipo que termina y da paso a una posesión rival en juego abierto.
+
+Para cada pérdida guardamos:
+
+-   equipo que pierde el balón;
+-   equipo que recupera/transiciona;
+-   posición estimada de pérdida;
+-   acción que explica la pérdida (`Block`, `Interception`, `Duel`, `Miscontrol`, etc.);
+-   si el rival tira dentro de una ventana configurable;
+-   minuto, marcador e igualdad numérica.
+
+## Marco conceptual
+
+La **zona de acción inmediata** describe el entorno más cercano al punto de pérdida. En los primeros segundos de una transición, la presión sobre el nuevo poseedor y la presencia de defensores próximos suelen condicionar la capacidad del rival para girar, conducir, progresar o conectar con un compañero libre. Por ese motivo se calcula, dentro de un radio configurable, cuántos jugadores de cada equipo intervienen en la zona, la distancia del defensor más cercano al balón y cuántos defensores se encuentran en posición *goal-side*, es decir, entre el balón y la portería propia.
+
+La **vigilancia ofensiva** se entiende aquí como la forma en la que el equipo que ataca mantiene preparada su última línea mientras conserva la posesión. Aunque el equipo esté atacando, sus defensores deben ocupar posiciones que permitan controlar una posible pérdida: proteger el espacio a la espalda, mantener referencias sobre los atacantes rivales y evitar que una recuperación rival active una transición directa hacia portería. Una vigilancia ofensiva eficaz no se limita a acumular jugadores detrás del balón; también exige que esos jugadores estén ubicados en zonas útiles para intervenir, temporizar o cerrar líneas de progresión.
+
+En este sentido, se distinguen dos tipos de superioridad. La **superioridad numérica** aparece cuando un equipo tiene más jugadores que el rival en una zona relevante. Puede facilitar la presión tras pérdida, la cobertura y la capacidad de cerrar receptores cercanos. Sin embargo, por sí sola no garantiza control: varios defensores mal colocados pueden seguir dejando una vía clara de progresión. La **superioridad posicional** atiende a la ubicación relativa de los jugadores. En una transición defensiva, estar por detrás del balón, orientar al rival hacia zonas menos peligrosas o controlar el espacio entre el poseedor y la portería puede ser más determinante que la mera cantidad de jugadores.
+
+Por eso, además del área inmediata, se caracteriza el **rol de la última línea defensiva**. La última línea define el espacio crítico que queda entre los defensores más retrasados y la portería propia. Si esa línea está demasiado alta, desorganizada o con atacantes rivales libres a su espalda, una pérdida puede convertirse rápidamente en una ocasión clara. Para medir este aspecto se calculan variables como la distancia del último defensor a portería, el balance de jugadores en la zona de última línea, el control territorial mediante Voronoi y la distancia media de marcaje sobre los atacantes presentes en ese espacio.
+
+El análisis incorpora también **factores contextuales**. El minuto de partido, la diferencia en el marcador y la igualdad numérica pueden modificar el comportamiento de los equipos: un equipo que gana puede asumir menos riesgo tras pérdida, uno que pierde puede quedar más expuesto al atacar con más jugadores, y una expulsión altera tanto la presión inmediata como la cobertura de la última línea. Estas variables no describen directamente la geometría de la acción, pero ayudan a interpretar por qué una misma pérdida puede tener consecuencias distintas según el estado del partido.
+
+En conjunto, el notebook transforma eventos de StatsBomb y datos 360 en variables diseñadas para responder a una pregunta aplicada: qué rasgos de la estructura defensiva tras pérdida reducen o aumentan la probabilidad de conceder un tiro en la transición posterior.
+
+## Disponibilidad de datos 360 en StatsBomb Open Data
+
+StatsBomb Open Data almacena los eventos de cada partido en `data/events` y los datos 360 en `data/three-sixty`, pero estos últimos solo existen para partidos seleccionados. Para evitar interpretar como error una ausencia real de fotogramas 360, se ha revisado el árbol completo del repositorio oficial y se ha cruzado cada archivo `three-sixty/{match_id}.json` con los archivos de partidos `matches/{competition_id}/{season_id}.json`.
+
+| Competición | País | Temporada | `competition_id` | `season_id` | Partidos con 360 | Partidos totales | Cobertura |
+|---|---|---:|---:|---:|---:|---:|---:|
+| FIFA World Cup | International | 2022 | 43 | 106 | 64 | 64 | 100.0% |
+| Women's World Cup | International | 2023 | 72 | 107 | 64 | 64 | 100.0% |
+| UEFA Euro | Europe | 2020 | 55 | 43 | 51 | 51 | 100.0% |
+| UEFA Euro | Europe | 2024 | 55 | 282 | 51 | 51 | 100.0% |
+| 1. Bundesliga | Germany | 2023/2024 | 9 | 281 | 34 | 34 | 100.0% |
+| UEFA Women's Euro | Europe | 2022 | 53 | 106 | 31 | 31 | 100.0% |
+| UEFA Women's Euro | Europe | 2025 | 53 | 315 | 31 | 31 | 100.0% |
+
+La Liga 2015/2016 (`competition_id = 11`, `season_id = 27`) contiene 380 partidos de eventos, pero no aparece en esta tabla porque ninguno de sus `match_id` dispone de archivo 360 asociado. Por tanto, cuando se selecciona esa temporada, el notebook entrena modelos de referencia con las variables de eventos, localización y contexto disponibles, pero no puede calcular de forma completa las métricas de vigilancia ofensiva basadas en freeze frames.
+
+```{python}
+# Instala las dependencias necesarias si no están disponibles en el entorno.
+# · scipy viene habitualmente en distribuciones científicas (Anaconda, etc.)
+# · shapely es necesaria para el clipping de polígonos Voronoi (sección 8).
+import importlib, subprocess, sys
+
+_required_packages = {
+    "scipy": "scipy",
+    "shapely": "shapely",
+    "mplsoccer": "mplsoccer",
+    "statsbombpy": "statsbombpy",
+    "sklearn": "scikit-learn",
+}
+
+for _module, _pip_name in _required_packages.items():
+    if importlib.util.find_spec(_module) is None:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", _pip_name])
+        print(f"✓ Instalado: {_pip_name}")
+    else:
+        print(f"✓ Ya disponible: {_pip_name}")
+```
+
+```{python}
+import warnings
+
+import numpy as np
+import pandas as pd
+from statsbombpy import sb
+
+try:
+    from IPython.display import display
+except Exception:
+    display = print
+
+warnings.filterwarnings("ignore")
+pd.set_option("display.max_columns", 140)
+pd.set_option("display.max_rows", 100)
+```
+
+## 1. Elegir muestra de partidos
+
+Los parámetros permiten seleccionar desde un único partido hasta una o varias competiciones completas. Para trabajar con una muestra conjunta, se define una lista de parejas `(competition_id, season_id)` y el notebook concatena automáticamente todos los partidos antes de procesar eventos y datos 360.
+
+```{python}
+# -- Competiciones -------------------------------------------------------------
+# Cada grupo se procesa por separado para poder comparar el rendimiento de los
+# modelos entre fútbol femenino y masculino manteniendo datos 360.
+DATASET_GROUPS = {
+    "Femenino": [
+        (72, 107),  # Women's World Cup 2023       -> 64 partidos
+        (53, 106),  # UEFA Women's Euro 2022       -> 31 partidos
+        (53, 315),  # UEFA Women's Euro 2025       -> 31 partidos
+    ],
+    "Masculino": [
+        (43, 106),  # FIFA World Cup 2022          -> 64 partidos
+        (55, 43),   # UEFA Euro 2020               -> 51 partidos
+        (55, 282),  # UEFA Euro 2024               -> 51 partidos
+        (9, 281),   # 1. Bundesliga 2023/2024      -> 34 partidos
+    ],
+}
+
+COMPETITION_SEASONS = [
+    pair
+    for _pairs in DATASET_GROUPS.values()
+    for pair in _pairs
+]
+_competition_group_lookup = {
+    tuple(pair): group
+    for group, pairs in DATASET_GROUPS.items()
+    for pair in pairs
+}
+
+# Compatibilidad con el modo antiguo de una sola competición.
+COMPETITION_ID, SEASON_ID = COMPETITION_SEASONS[0]
+
+# -- Selección de partidos a cargar -------------------------------------------
+# MATCH_ID    -> None = todos los partidos filtrados por TEAM_FILTER
+#                int  = un partido concreto (ignora TEAM_FILTER)
+# TEAM_FILTER -> None = todos los equipos de la temporada
+#                str  = solo partidos en los que participe ese equipo
+#                       (ej. "RB Leipzig", "Bayer Leverkusen")
+MATCH_ID    = None
+TEAM_FILTER = None
+
+# Prueba rápida opcional. Déjalo en None para el análisis completo.
+# Si vale 2, usa los 2 primeros partidos de cada sample_group.
+SMOKE_TEST_MATCHES_PER_GROUP = None
+
+# -- Filtro de transiciones defensivas ----------------------------------------
+# Controla QUÉ EQUIPO(S) se estudian como equipo que PIERDE el balón.
+# Independiente de TEAM_FILTER: puedes cargar todos los partidos de la liga
+# y quedarte solo con las pérdidas de un equipo concreto.
+#
+# LOSING_TEAM_FILTER -> None = todas las pérdidas (sin filtro)
+#                       str  = solo pérdidas de ese equipo
+#                              (ej. "RB Leipzig")
+#                       list = pérdidas de cualquiera de esos equipos
+#                              (ej. ["RB Leipzig", "Bayer Leverkusen"])
+LOSING_TEAM_FILTER = None
+
+# -- Ventana temporal para el target ------------------------------------------
+# SHOT_WINDOW_SECONDS define la variable objetivo:
+#   transition_shot_within_window = 1 si el rival tira en <= N segundos tras la pérdida.
+# Es el único parámetro de ventana del notebook: lo usan tanto la construcción
+# del dataset (sección 5 y bucle por lotes) como la función first_shot_after_turnover().
+SHOT_WINDOW_SECONDS = 20
+
+# -- Discretización de coordenadas (zona de campo) ----------------------------
+# El campo se divide en una rejilla de PITCH_BINS_X x PITCH_BINS_Y celdas
+# usadas para crear la variable categórica 'loss_zone_bin' (1 .. N).
+# Con 6x4 = 24 zonas, cada zona mide 20x20 unidades StatsBomb (~17.5 m x 17 m).
+PITCH_BINS_X = 6
+PITCH_BINS_Y = 4
+
+# -- Caché local ---------------------------------------------------------------
+# Evita reprocesar eventos y 360 en cada render.
+# REBUILD_DATA_CACHE = True fuerza la reconstrucción desde StatsBomb.
+# El notebook ignora automáticamente cachés vacías o incompletas.
+USE_DATA_CACHE = True
+REBUILD_DATA_CACHE = False
+CACHE_DIR = "cache_modelos"
+
+# ------------------------------------------------------------------------------
+_match_frames = []
+for _competition_id, _season_id in COMPETITION_SEASONS:
+    _matches_part = sb.matches(
+        competition_id=_competition_id,
+        season_id=_season_id,
+    ).copy()
+    _matches_part["source_competition_id"] = int(_competition_id)
+    _matches_part["source_season_id"] = int(_season_id)
+    _matches_part["sample_group"] = _competition_group_lookup.get(
+        (int(_competition_id), int(_season_id)),
+        "Sin grupo",
+    )
+    if "competition" not in _matches_part.columns:
+        _matches_part["competition"] = f"competition_{_competition_id}"
+    if "season" not in _matches_part.columns:
+        _matches_part["season"] = f"season_{_season_id}"
+    _matches_part["source_competition_season"] = (
+        _matches_part["competition"].astype(str)
+        + " "
+        + _matches_part["season"].astype(str)
+    )
+    _match_frames.append(_matches_part)
+
+matches = (
+    pd.concat(_match_frames, ignore_index=True)
+    .drop_duplicates(subset=["match_id"])
+    .sort_values(["match_date", "match_id"])
+    .reset_index(drop=True)
+)
+
+_requested_match_id = MATCH_ID
+
+if MATCH_ID is not None:
+    # Modo partido único: ignorar TEAM_FILTER
+    matches_filtered = matches[matches["match_id"] == int(MATCH_ID)].reset_index(drop=True)
+    if matches_filtered.empty:
+        raise ValueError(f"MATCH_ID={MATCH_ID} no encontrado en la competición/temporada.")
+elif TEAM_FILTER is not None:
+    matches_filtered = matches[
+        (matches["home_team"] == TEAM_FILTER) | (matches["away_team"] == TEAM_FILTER)
+    ].reset_index(drop=True)
+    if matches_filtered.empty:
+        _eq = sorted(set(matches["home_team"]) | set(matches["away_team"]))
+        raise ValueError(
+            f"No hay partidos para TEAM_FILTER={TEAM_FILTER!r}. "
+            f"Equipos disponibles: {_eq}"
+        )
+else:
+    matches_filtered = matches.copy()
+
+if SMOKE_TEST_MATCHES_PER_GROUP is not None:
+    matches_filtered = (
+        matches_filtered
+        .sort_values(["sample_group", "match_date", "match_id"])
+        .groupby("sample_group", observed=True, group_keys=False)
+        .head(int(SMOKE_TEST_MATCHES_PER_GROUP))
+        .reset_index(drop=True)
+    )
+    print(
+        f"⚠ Smoke test activo: {SMOKE_TEST_MATCHES_PER_GROUP} "
+        "partidos por sample_group."
+    )
+
+match_ids_to_process = matches_filtered["match_id"].astype(int).tolist()
+
+# Las secciones 2-8 procesan el primer partido como ejemplo educativo.
+MATCH_ID   = match_ids_to_process[0]
+match_info = matches_filtered[matches_filtered["match_id"] == MATCH_ID].copy()
+home_team  = match_info.iloc[0]["home_team"]
+away_team  = match_info.iloc[0]["away_team"]
+
+print("Competiciones seleccionadas:")
+display(
+    matches_filtered
+    .groupby(["sample_group", "source_competition_id", "source_season_id", "competition", "season"], observed=True)
+    .agg(partidos=("match_id", "nunique"))
+    .reset_index()
+)
+print(f"Partidos seleccionados : {len(match_ids_to_process)}")
+print(f"Partido de ejemplo (secciones 2-8): {MATCH_ID}  ({home_team} vs {away_team})")
+if "match_available_360" in matches_filtered.columns:
+    _n_matches_360 = matches_filtered["match_available_360"].notna().sum()
+    print(f"Partidos con 360 según metadatos StatsBomb: {_n_matches_360}/{len(matches_filtered)}")
+    if _n_matches_360 == 0:
+        print("⚠ La competición/temporada seleccionada no declara datos 360 asociados.")
+display(matches_filtered[[
+    "sample_group", "source_competition_id", "source_season_id", "competition", "season",
+    "match_id", "match_date", "home_team", "away_team", "home_score", "away_score",
+]])
+```
+
+## 2. Cargar eventos
+
+Si falta alguna columna, la creamos con `pd.NA`. Esto evita que el notebook se rompa entre partidos con columnas distintas.
+
+```{python}
+COLS_NEEDED = [
+    "id", "index", "period", "timestamp", "minute", "second",
+    "type", "play_pattern", "possession", "possession_team", "team", "player",
+    "location", "out", "under_pressure", "counterpress",
+    "shot_outcome", "shot_statsbomb_xg",
+    "ball_recovery_recovery_failure",
+    "ball_recovery_offensive",
+    "block_deflection", "block_offensive", "block_save_block",
+    "interception_outcome",
+    "duel_type", "duel_outcome",
+    "50_50_outcome",
+    "clearance_aerial_won", "clearance_body_part",
+    "pass_outcome", "pass_end_location", "dribble_outcome", "ball_receipt_outcome",
+    "foul_committed_card", "bad_behaviour_card",
+]
+
+
+def has_xy(value):
+    return isinstance(value, (list, tuple)) and len(value) >= 2
+
+
+def get_x(value):
+    return float(value[0]) if has_xy(value) else np.nan
+
+
+def get_y(value):
+    return float(value[1]) if has_xy(value) else np.nan
+
+
+def get_end_x(value):
+    return float(value[0]) if has_xy(value) else np.nan
+
+
+def get_end_y(value):
+    return float(value[1]) if has_xy(value) else np.nan
+
+
+def prepare_events(raw_events):
+    events = raw_events.copy()
+
+    # Rellenamos columnas que no existan en este partido.
+    for col in COLS_NEEDED:
+        if col not in events.columns:
+            events[col] = pd.NA
+
+    events = events[COLS_NEEDED].copy()
+
+    # Orden estable de eventos dentro del partido.
+    fallback_order = pd.Series(np.arange(len(events)), index=events.index)
+    events["event_order"] = pd.to_numeric(events["index"], errors="coerce").fillna(fallback_order)
+
+    # Coordenadas StatsBomb: location = [x, y].
+    events["x"] = events["location"].apply(get_x)
+    events["y"] = events["location"].apply(get_y)
+    events["pass_end_x"] = events["pass_end_location"].apply(get_end_x)
+    events["pass_end_y"] = events["pass_end_location"].apply(get_end_y)
+
+    events["period"] = pd.to_numeric(events["period"], errors="coerce").fillna(0).astype(int)
+    events["minute"] = pd.to_numeric(events["minute"], errors="coerce")
+    events["second"] = pd.to_numeric(events["second"], errors="coerce")
+    events["event_seconds"] = events["minute"].fillna(0) * 60 + events["second"].fillna(0)
+    events["possession"] = pd.to_numeric(events["possession"], errors="coerce")
+    events["match_id"] = int(MATCH_ID)
+
+    return events.sort_values(["period", "event_order"]).reset_index(drop=True)
+
+
+def _event_key(value):
+    """Clave estable para cruzar eventos StatsBomb con datos 360."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return str(value)
+
+
+def _normalise_freeze_frame(freeze_frame):
+    """Reduce el freeze_frame bruto a los campos que usa el notebook."""
+    players = []
+    if not isinstance(freeze_frame, list):
+        return players
+
+    for player in freeze_frame:
+        if not isinstance(player, dict):
+            continue
+        loc = player.get("location")
+        if not has_xy(loc):
+            continue
+        players.append({
+            "teammate": bool(player.get("teammate", False)),
+            "actor": bool(player.get("actor", False)),
+            "keeper": bool(player.get("keeper", False)),
+            "location": [float(loc[0]), float(loc[1])],
+        })
+    return players
+
+
+def load_360_lookups(match_id, verbose=True):
+    """Carga freeze frames y áreas visibles, con fallback al JSON bruto.
+
+    statsbombpy puede fallar en `sb.frames()` en algunos entornos por problemas
+    de compatibilidad pandas. En ese caso reconstruimos los mismos diccionarios
+    desde el JSON abierto `three-sixty/{match_id}.json`.
+    """
+    freeze = {}
+    visible = {}
+
+    try:
+        frames = sb.frames(match_id=match_id)
+        id_col = "id" if "id" in frames.columns else "event_uuid"
+
+        needed = ["teammate", "actor", "keeper", "location"]
+        for col in needed:
+            if col not in frames.columns:
+                frames[col] = False if col != "location" else pd.NA
+
+        freeze = {
+            _event_key(event_id): grp[needed].to_dict("records")
+            for event_id, grp in frames.groupby(id_col)
+            if _event_key(event_id) is not None
+        }
+
+        if "visible_area" in frames.columns:
+            va_series = (
+                frames.drop_duplicates(subset=id_col)
+                .set_index(id_col)["visible_area"]
+            )
+            visible = {
+                _event_key(event_id): va
+                for event_id, va in va_series.items()
+                if _event_key(event_id) is not None
+                and isinstance(va, list)
+                and len(va) >= 6
+            }
+    except Exception as exc:
+        if verbose:
+            print(f"  ⚠ sb.frames() falló para {match_id}; usando JSON bruto three-sixty ({exc})")
+
+    if not freeze or not visible:
+        try:
+            import requests as _req
+            url = (
+                "https://raw.githubusercontent.com/statsbomb/open-data"
+                f"/master/data/three-sixty/{match_id}.json"
+            )
+            resp = _req.get(url, timeout=20)
+            if resp.status_code == 200:
+                for rec in resp.json():
+                    key = _event_key(rec.get("event_uuid") or rec.get("id"))
+                    if key is None:
+                        continue
+
+                    if key not in freeze:
+                        players = _normalise_freeze_frame(rec.get("freeze_frame"))
+                        if players:
+                            freeze[key] = players
+
+                    va = rec.get("visible_area")
+                    if key not in visible and isinstance(va, list) and len(va) >= 6:
+                        visible[key] = va
+            else:
+                if verbose:
+                    print(f"  ⚠ GitHub three-sixty devolvió HTTP {resp.status_code}")
+        except Exception as exc:
+            if verbose:
+                print(f"  ⚠ Fallback GitHub three-sixty falló para {match_id}: {exc}")
+
+    return freeze, visible
+
+
+raw_events = sb.events(match_id=MATCH_ID)
+events = prepare_events(raw_events)
+
+# Datos 360: archivo complementario con fotogramas de posiciones de jugadores.
+# statsbombpy los expone a través de sb.frames(), que devuelve UNA FILA POR JUGADOR
+# y renombra event_uuid → id. Reagrupamos por id para reconstruir la lista de
+# jugadores por evento, que es el formato que necesita zone_variables().
+freeze_lookup, visible_area_lookup = load_360_lookups(MATCH_ID, verbose=True)
+
+_event_ids = set(events["id"].dropna().map(_event_key))
+_freeze_ids = set(freeze_lookup)
+print(f"Eventos con fotograma 360: {len(freeze_lookup):,}  "
+      f"|  Áreas visibles: {len(visible_area_lookup):,}  "
+      f"|  Cruce con eventos: {len(_event_ids & _freeze_ids):,}")
+
+print(f"Eventos cargados: {len(events):,}")
+events.head()
+```
+
+## 3. Concepto: pérdida vs recuperación
+
+Una **pérdida** se mira desde el equipo que tenía la posesión.
+
+Una **recuperación** se mira desde el rival que roba o recoge el balón.
+
+Para la regresión queremos una fila por pérdida:
+
+``` text
+equipo A ataca -> equipo A pierde -> equipo B transiciona -> equipo B tira o no tira dentro de la ventana
+```
+
+Por eso partimos de cambios de posesión entre equipos, no de eventos sueltos.
+
+```{python}
+OPEN_PLAY_NEXT_PATTERNS = {"Regular Play", "From Counter"}
+# SHOT_WINDOW_SECONDS se define en la sección 1 (bloque de parámetros).
+
+
+def is_true(value):
+    if pd.isna(value):
+        return False
+    if isinstance(value, str):
+        return value.lower() in {"true", "1", "yes", "si", "sí"}
+    return bool(value)
+
+
+def possession_meta(events):
+    """Una fila por posesión: equipo, inicio y final."""
+    return (
+        events.dropna(subset=["possession"])
+        .sort_values(["period", "event_order"])
+        .groupby(["match_id", "period", "possession"], observed=True)
+        .agg(
+            possession_team=("possession_team", "first"),
+            play_pattern=("play_pattern", "first"),
+            start_order=("event_order", "min"),
+            end_order=("event_order", "max"),
+            start_seconds=("event_seconds", "min"),
+            end_seconds=("event_seconds", "max"),
+        )
+        .reset_index()
+        .sort_values(["period", "start_order"])
+        .reset_index(drop=True)
+    )
+
+
+meta = possession_meta(events)
+meta.head(10)
+```
+
+## 4. Elegir la acción que explica la pérdida
+
+Para cada cambio de posesión en juego abierto:
+
+1.  `losing_team` es el `possession_team` de la posesión que acaba.
+2.  `transition_team` es el `possession_team` de la siguiente posesión.
+3.  Buscamos cerca del cambio una acción que explique la pérdida.
+
+Priorizamos acciones defensivas del equipo que roba: `Block`, `Interception`, `Duel/Tackle`, `50/50`, `Clearance`.
+
+Si no hay una acción defensiva dentro de la posesión que acaba, aceptamos un `Ball Recovery` solo cuando es el primer evento de la nueva posesión y la posesión anterior contiene una señal clara de pérdida (`Ball Receipt* Incomplete`, `Miscontrol`, `Dispossessed`, `Pass Incomplete`, etc.). Así capturamos balones sueltos sin usar ventanas arbitrarias.
+
+Si no encontramos acción defensiva clara, usamos la última acción de ataque del equipo que pierde: `Miscontrol`, `Dispossessed`, `Dribble`, `Pass`, etc.
+
+```{python}
+DEFENSIVE_PRIORITY = {
+    "Block": 1,
+    "Interception": 2,
+    "Duel": 3,
+    "50/50": 4,
+    "Clearance": 5,
+}
+
+ATTACKING_PRIORITY = {
+    "Miscontrol": 1,
+    "Dispossessed": 2,
+    "Dribble": 3,
+    "Pass": 4,
+    "Carry": 5,
+    "Ball Receipt*": 6,
+}
+
+VALID_TACKLE_OUTCOMES = {"Won", "Success", "Success In Play"}
+VALID_INTERCEPTION_OUTCOMES = {"Won", "Success", "In Play", "Success In Play"}
+VALID_50_50_OUTCOMES = {"Won", "Success To Team"}
+INCOMPLETE_PASS_OUTCOMES = {"Incomplete", "Out", "Pass Offside", "Unknown", "Injury Clearance"}
+INCOMPLETE_DRIBBLE_OUTCOMES = {"Incomplete"}
+INCOMPLETE_RECEIPT_OUTCOMES = {"Incomplete"}
+SHOT_END_TYPES = {"Shot", "Goal Keeper"}
+
+
+def mirror_x(x):
+    return PITCH_LENGTH - x if pd.notna(x) else np.nan
+
+
+def mirror_y(y):
+    return PITCH_WIDTH - y if pd.notna(y) else np.nan
+
+
+PITCH_LENGTH = 120
+PITCH_WIDTH = 80
+
+
+def is_restart_or_out(previous_events, next_possession):
+    """Excluye cambios por banda, faltas, corners, saques, etc."""
+    if next_possession["play_pattern"] not in OPEN_PLAY_NEXT_PATTERNS:
+        return True
+
+    if previous_events.empty:
+        return True
+
+    last_event = previous_events.sort_values("event_order").iloc[-1]
+
+    # Si la posesión anterior contiene un tiro, no es una pérdida de las que
+    # queremos modelar. Es una posesión que ya termino atacando.
+    if (previous_events["type"] == "Shot").any():
+        return True
+
+    # Si acaba con acción de portero, también suele ser una continuación natural
+    # tras tiro, parada, recepción del portero o reinicio.
+    if str(last_event.get("type", "")) == "Goal Keeper":
+        return True
+
+    if is_true(last_event.get("out", pd.NA)):
+        return True
+
+    if str(last_event.get("pass_outcome", "")) in {"Out", "Pass Offside", "Injury Clearance"}:
+        return True
+
+    return False
+
+
+def has_attacking_loss_signal(event):
+    """True si el evento del equipo que ataca describe pérdida o mal control."""
+    event_type = event.get("type")
+
+    if event_type in {"Miscontrol", "Dispossessed"}:
+        return True
+    if event_type == "Ball Receipt*":
+        return str(event.get("ball_receipt_outcome")) in INCOMPLETE_RECEIPT_OUTCOMES
+    if event_type == "Dribble":
+        return str(event.get("dribble_outcome")) in INCOMPLETE_DRIBBLE_OUTCOMES
+    if event_type == "Pass":
+        return str(event.get("pass_outcome")) in INCOMPLETE_PASS_OUTCOMES
+    if event_type == "Duel":
+        return "Lost" in str(event.get("duel_outcome"))
+    return False
+
+
+def attacking_loss_candidates(previous_events, losing_team):
+    """Eventos del equipo que pierde que explican la pérdida."""
+    candidates = previous_events[
+        (previous_events["team"] == losing_team)
+        & (previous_events["type"].isin(ATTACKING_PRIORITY) | (previous_events["type"] == "Duel"))
+        & previous_events["x"].notna()
+        & previous_events["y"].notna()
+    ].copy()
+
+    if candidates.empty:
+        return candidates
+
+    candidates = candidates[candidates.apply(has_attacking_loss_signal, axis=1)].copy()
+    if candidates.empty:
+        return candidates
+
+    candidates["priority"] = candidates["type"].map(ATTACKING_PRIORITY).fillna(7)
+    return candidates
+
+
+def first_next_possession_recovery(events, next_possession, transition_team):
+    """Ball Recovery válido solo si abre la nueva posesión."""
+    next_events = events[
+        (events["period"] == int(next_possession["period"]))
+        & (events["possession"] == next_possession["possession"])
+    ].sort_values("event_order").copy()
+
+    if next_events.empty:
+        return pd.Series(dtype="object")
+
+    first_event = next_events.iloc[0]
+    if (
+        first_event.get("type") == "Ball Recovery"
+        and first_event.get("team") == transition_team
+        and pd.isna(first_event.get("ball_recovery_recovery_failure"))
+        and pd.notna(first_event.get("x"))
+        and pd.notna(first_event.get("y"))
+    ):
+        return first_event
+
+    return pd.Series(dtype="object")
+
+
+def event_location_for_loss(event):
+    """Punto físico de pérdida para el evento elegido.
+
+    Para un pase incompleto, preferimos el destino del pase si existe.
+    Para el resto usamos la localización del evento.
+    """
+    if event.get("type") == "Pass" and pd.notna(event.get("pass_end_x")) and pd.notna(event.get("pass_end_y")):
+        return float(event["pass_end_x"]), float(event["pass_end_y"])
+    return float(event["x"]), float(event["y"])
+
+
+def filter_valid_defensive_candidates(candidates):
+    """Evita meter duelos/intercepciones que no ganan realmente la pelota."""
+    if candidates.empty:
+        return candidates
+
+    valid = []
+    for _, event in candidates.iterrows():
+        event_type = event["type"]
+
+        if event_type == "Duel":
+            valid.append(
+                event.get("duel_type") == "Tackle"
+                and str(event.get("duel_outcome")) in VALID_TACKLE_OUTCOMES
+            )
+        elif event_type == "Interception":
+            valid.append(
+                str(event.get("interception_outcome")) in VALID_INTERCEPTION_OUTCOMES
+                or pd.isna(event.get("interception_outcome"))
+            )
+        elif event_type == "50/50":
+            valid.append(str(event.get("50_50_outcome")) in VALID_50_50_OUTCOMES)
+        else:
+            valid.append(True)
+
+    return candidates[pd.Series(valid, index=candidates.index)].copy()
+
+
+def choose_turnover_event(events, current_possession, next_possession):
+    """Elige el evento que mejor representa la pérdida."""
+    losing_team = current_possession["possession_team"]
+    transition_team = next_possession["possession_team"]
+    period = int(current_possession["period"])
+
+    # Eventos de la posesión que acaba.
+    previous_events = events[
+        (events["period"] == period)
+        & (events["possession"] == current_possession["possession"])
+    ].copy()
+
+    # Primero buscamos acciones defensivas del equipo que transiciona, pero
+    # SOLO dentro de la posesión que pierde el rival.
+    defensive_candidates = previous_events.copy()
+    defensive_candidates = defensive_candidates[
+        (defensive_candidates["team"] == transition_team)
+        & (defensive_candidates["type"].isin(DEFENSIVE_PRIORITY))
+        & defensive_candidates["x"].notna()
+        & defensive_candidates["y"].notna()
+    ].copy()
+    defensive_candidates = filter_valid_defensive_candidates(defensive_candidates)
+
+    if not defensive_candidates.empty:
+        defensive_candidates["priority"] = defensive_candidates["type"].map(DEFENSIVE_PRIORITY)
+        event = defensive_candidates.sort_values(["priority", "event_order"]).iloc[0]
+        source = "defensive_event"
+    else:
+        attacking_candidates = attacking_loss_candidates(previous_events, losing_team)
+
+        # Ball Recovery entra solo si la posesión previa tiene una pérdida clara
+        # y el Ball Recovery abre la nueva posesión.
+        next_recovery = first_next_possession_recovery(events, next_possession, transition_team)
+        if not attacking_candidates.empty and not next_recovery.empty:
+            event = next_recovery
+            source = "next_possession_recovery"
+        elif not attacking_candidates.empty:
+            # Si no hay recuperación inicial, usamos la última señal de pérdida
+            # del equipo que atacaba.
+            event = attacking_candidates.sort_values(["event_order", "priority"], ascending=[False, True]).iloc[0]
+            source = "attacking_event"
+        else:
+            return None, previous_events
+
+    event_x, event_y = event_location_for_loss(event)
+
+    return {
+        "turnover_event_source": source,
+        "turnover_event_id": _event_key(event.get("id", pd.NA)),
+        "turnover_action_type": event.get("type", pd.NA),
+        "turnover_player": event.get("player", pd.NA),
+        "turnover_event_team": event.get("team", pd.NA),
+        "turnover_event_order": float(event["event_order"]),
+        "turnover_event_seconds": float(event["event_seconds"]),
+        "turnover_x": event_x,
+        "turnover_y": event_y,
+        "raw_event_x": float(event["x"]),
+        "raw_event_y": float(event["y"]),
+        "pass_outcome": event.get("pass_outcome", pd.NA),
+        "dribble_outcome": event.get("dribble_outcome", pd.NA),
+        "ball_receipt_outcome": event.get("ball_receipt_outcome", pd.NA),
+        "duel_type": event.get("duel_type", pd.NA),
+        "duel_outcome": event.get("duel_outcome", pd.NA),
+        "interception_outcome": event.get("interception_outcome", pd.NA),
+        "50_50_outcome": event.get("50_50_outcome", pd.NA),
+        "clearance_aerial_won": event.get("clearance_aerial_won", pd.NA),
+        "clearance_body_part": event.get("clearance_body_part", pd.NA),
+        "ball_recovery_offensive": event.get("ball_recovery_offensive", pd.NA),
+        "block_deflection": event.get("block_deflection", pd.NA),
+        "block_offensive": event.get("block_offensive", pd.NA),
+        "block_save_block": event.get("block_save_block", pd.NA),
+        "under_pressure": event.get("under_pressure", pd.NA),
+        "counterpress": event.get("counterpress", pd.NA),
+    }, previous_events
+```
+
+## 5. Construir dataset de pérdidas
+
+Guardamos dos pares de coordenadas:
+
+-   `loss_x`, `loss_y`: punto visto desde el equipo que pierde el balón. Son las variables principales para modelar riesgo de pérdida.
+-   `transition_x`, `transition_y`: el mismo punto visto desde el equipo que roba/transiciona. Sirven para debug y mapas desde el equipo que ataca después.
+
+Si el evento elegido lo hace el rival (`defensive_event` o `next_possession_recovery`), `turnover_x/y` ya están en perspectiva del equipo que transiciona y los espejamos para obtener `loss_x/y`.
+
+Si el evento elegido lo hace el equipo que pierde (`attacking_event`), `turnover_x/y` ya son `loss_x/y` y los espejamos para obtener `transition_x/y`.
+
+También creamos `loss_zone_bin`, una **variable categórica única** (entero 1..N) que combina `loss_x` y `loss_y` discretizando el campo en una rejilla `PITCH_BINS_X x PITCH_BINS_Y`. Es útil en regresión logística (one-hot encoding) cuando se quiere capturar la zona de pérdida sin asumir linealidad en x e y.
+
+```{python}
+# Dimensiones del campo en unidades StatsBomb (campo completo 120 x 80).
+_SB_LENGTH_FOR_BINS = 120.0
+_SB_WIDTH_FOR_BINS  = 80.0
+
+
+def pitch_bin(x, y, n_x=None, n_y=None):
+    """Discretiza (x, y) en un entero de 1 a n_x*n_y siguiendo orden columna mayor.
+
+    El bin se calcula sobre el sistema normalizado del equipo que pierde
+    (x crece hacia la portería rival). Devuelve pd.NA si las coordenadas no son
+    finitas.
+    """
+    if n_x is None: n_x = PITCH_BINS_X
+    if n_y is None: n_y = PITCH_BINS_Y
+    if not (np.isfinite(x) and np.isfinite(y)):
+        return pd.NA
+    # Clip para tolerar coordenadas levemente fuera del campo
+    x_c = max(0.0, min(_SB_LENGTH_FOR_BINS - 1e-9, float(x)))
+    y_c = max(0.0, min(_SB_WIDTH_FOR_BINS  - 1e-9, float(y)))
+    ix = int(x_c // (_SB_LENGTH_FOR_BINS / n_x))
+    iy = int(y_c // (_SB_WIDTH_FOR_BINS  / n_y))
+    return int(ix * n_y + iy + 1)   # 1-indexed
+
+
+def first_shot_after_turnover(events, transition_team, next_possession, t0_seconds, window_seconds=None):
+    """Primer tiro del equipo que transiciona en su siguiente posesión y dentro de la ventana.
+
+    Si window_seconds es None se usa el parámetro global SHOT_WINDOW_SECONDS
+    definido en la sección 1.
+    """
+    if window_seconds is None:
+        window_seconds = SHOT_WINDOW_SECONDS
+    shots = events[
+        (events["period"] == int(next_possession["period"]))
+        & (events["possession"] == next_possession["possession"])
+        & (events["team"] == transition_team)
+        & (events["type"] == "Shot")
+    ].copy()
+
+    if shots.empty:
+        return {
+            "transition_shot_within_window": 0,
+            "seconds_to_shot": np.nan,
+            "shot_player": pd.NA,
+            "shot_outcome": pd.NA,
+            "shot_statsbomb_xg": np.nan,
+        }
+
+    shots["seconds_to_shot"] = shots["event_seconds"] - t0_seconds
+    shots = shots[
+        (shots["seconds_to_shot"] >= 0)
+        & (shots["seconds_to_shot"] <= window_seconds)
+    ].sort_values(["seconds_to_shot", "event_order"])
+
+    if shots.empty:
+        return {
+            "transition_shot_within_window": 0,
+            "seconds_to_shot": np.nan,
+            "shot_player": pd.NA,
+            "shot_outcome": pd.NA,
+            "shot_statsbomb_xg": np.nan,
+        }
+
+    shot = shots.iloc[0]
+    return {
+        "transition_shot_within_window": 1,
+        "seconds_to_shot": float(shot["seconds_to_shot"]),
+        "shot_player": shot.get("player", pd.NA),
+        "shot_outcome": shot.get("shot_outcome", pd.NA),
+        "shot_statsbomb_xg": shot.get("shot_statsbomb_xg", np.nan),
+    }
+
+
+rows = []
+
+for i in range(len(meta) - 1):
+    current_poss = meta.iloc[i]
+    next_poss = meta.iloc[i + 1]
+
+    # Solo nos interesan cambios de posesión dentro del mismo período.
+    if current_poss["period"] != next_poss["period"]:
+        continue
+
+    losing_team = current_poss["possession_team"]
+    transition_team = next_poss["possession_team"]
+
+    # Si sigue el mismo equipo, no hay pérdida entre equipos.
+    if losing_team == transition_team:
+        continue
+
+    turnover_event, previous_events = choose_turnover_event(events, current_poss, next_poss)
+    if turnover_event is None:
+        continue
+
+    # Excluimos cambios por banda/falta/reinicio. Queremos transiciones en juego.
+    if is_restart_or_out(previous_events, next_poss):
+        continue
+
+    if turnover_event["turnover_event_source"] in {"defensive_event", "next_possession_recovery"}:
+        loss_x = mirror_x(turnover_event["turnover_x"])
+        loss_y = mirror_y(turnover_event["turnover_y"])
+        transition_x = turnover_event["turnover_x"]
+        transition_y = turnover_event["turnover_y"]
+    else:
+        loss_x = turnover_event["turnover_x"]
+        loss_y = turnover_event["turnover_y"]
+        transition_x = mirror_x(turnover_event["turnover_x"])
+        transition_y = mirror_y(turnover_event["turnover_y"])
+
+    shot_info = first_shot_after_turnover(
+        events=events,
+        transition_team=transition_team,
+        next_possession=next_poss,
+        # La transición empieza cuando arranca la nueva posesión del rival,
+        # no necesariamente en el evento defensivo que causó la pérdida.
+        t0_seconds=float(next_poss["start_seconds"]),
+        window_seconds=SHOT_WINDOW_SECONDS,
+    )
+
+    rows.append({
+        "match_id": int(current_poss["match_id"]),
+        "period": int(current_poss["period"]),
+        "losing_team": losing_team,
+        "transition_team": transition_team,
+        "lost_possession": current_poss["possession"],
+        "transition_possession": next_poss["possession"],
+        "lost_possession_play_pattern": current_poss["play_pattern"],
+        "transition_play_pattern": next_poss["play_pattern"],
+        "action_minute": round(float(next_poss["start_seconds"]) / 60, 2),
+        "event_seconds": float(next_poss["start_seconds"]),
+        "loss_x": loss_x,
+        "loss_y": loss_y,
+        "loss_zone_bin": pitch_bin(loss_x, loss_y),
+        "transition_x": transition_x,
+        "transition_y": transition_y,
+        **turnover_event,
+        **shot_info,
+    })
+
+loss_transition_events = pd.DataFrame(rows)
+
+print(f"pérdidas en juego detectadas (todos los equipos): {len(loss_transition_events):,}")
+
+if LOSING_TEAM_FILTER is not None and not loss_transition_events.empty:
+    _ltf_set = (
+        {LOSING_TEAM_FILTER} if isinstance(LOSING_TEAM_FILTER, str)
+        else set(LOSING_TEAM_FILTER)
+    )
+    _n_pre = len(loss_transition_events)
+    loss_transition_events = (
+        loss_transition_events[loss_transition_events["losing_team"].isin(_ltf_set)]
+        .reset_index(drop=True)
+    )
+    print(f"Filtro LOSING_TEAM_FILTER {sorted(_ltf_set)}: "
+          f"{_n_pre} -> {len(loss_transition_events):,} pérdidas")
+
+print(f"pérdidas con tiro rival en <= {SHOT_WINDOW_SECONDS}s: "
+      f"{int(loss_transition_events['transition_shot_within_window'].sum()) if not loss_transition_events.empty else 0:,}")
+loss_transition_events.head(20)
+```
+
+## 6. Contexto de marcador e igualdad numérica
+
+El contexto se calcula desde el punto de vista del equipo que pierde el balón.
+
+```{python}
+def opponent_of(team):
+    if team == home_team:
+        return away_team
+    if team == away_team:
+        return home_team
+    return pd.NA
+
+
+goals = (
+    events[(events["type"] == "Shot") & (events["shot_outcome"] == "Goal")]
+    [["period", "event_order", "event_seconds", "team"]]
+    .sort_values(["period", "event_order"])
+    .reset_index(drop=True)
+)
+
+red_card_values = {"Red Card", "Second Yellow", "Second Yellow Card"}
+red_cards = events[
+    events[["foul_committed_card", "bad_behaviour_card"]]
+    .apply(lambda row: any(str(value) in red_card_values for value in row.dropna()), axis=1)
+][["period", "event_order", "event_seconds", "team"]].copy()
+
+
+def score_state_before(period, event_order, team):
+    """Estado de marcador de un equipo antes de una acción."""
+    rival = opponent_of(team)
+    previous_goals = goals[
+        (goals["period"] < period)
+        | ((goals["period"] == period) & (goals["event_order"] < event_order))
+    ]
+
+    team_goals = int((previous_goals["team"] == team).sum())
+    rival_goals = int((previous_goals["team"] == rival).sum())
+    diff = team_goals - rival_goals
+
+    if diff > 0:
+        return "winning", diff
+    if diff < 0:
+        return "losing", diff
+    return "drawing", diff
+
+
+def numérical_equality_before(period, event_order, team):
+    """Igualdad numérica antes de una acción, restándo rojas previas."""
+    rival = opponent_of(team)
+    previous_reds = red_cards[
+        (red_cards["period"] < period)
+        | ((red_cards["period"] == period) & (red_cards["event_order"] < event_order))
+    ]
+
+    team_players = 11 - int((previous_reds["team"] == team).sum())
+    rival_players = 11 - int((previous_reds["team"] == rival).sum())
+    return team_players == rival_players, team_players, rival_players
+
+
+context_rows = []
+for _, loss in loss_transition_events.iterrows():
+    score_state, score_diff = score_state_before(
+        period=int(loss["period"]),
+        event_order=float(loss["turnover_event_order"]),
+        team=loss["losing_team"],
+    )
+    is_equal, losing_players, transition_players = numérical_equality_before(
+        period=int(loss["period"]),
+        event_order=float(loss["turnover_event_order"]),
+        team=loss["losing_team"],
+    )
+
+    context_rows.append({
+        "losing_team_score_state": score_state,
+        "losing_team_score_diff": score_diff,
+        "losing_team_players": losing_players,
+        "transition_team_players": transition_players,
+        # Positivo: el equipo que roba/transiciona tiene más jugadores.
+        # Negativo: el equipo que roba/transiciona tiene menos jugadores.
+        "transition_team_player_diff": transition_players - losing_players,
+        "is_numérical_equality": is_equal,
+    })
+
+context = pd.DataFrame(context_rows)
+model_dataset = pd.concat([loss_transition_events.reset_index(drop=True), context], axis=1)
+
+model_dataset.head()
+```
+
+## 7. Variables del área de acción inmediata
+
+Para cada pérdida calculamos, en un radio configurable alrededor del punto de pérdida, indicadores de superioridad local que la literatura de *football analytics* asocia con el riesgo de transición peligrosa.
+
+Las posiciones de los jugadores provienen de los datos **StatsBomb 360** cargados en la sección 2 (`freeze_lookup`). statsbombpy los expone a través de `sb.frames()`, que devuelve una fila por jugador y usa `id` como clave de evento (equivale al `id` de los eventos). En la sección 2 reagrupamos por `id` para reconstruir la lista de jugadores por evento. Las coordenadas se normalizan al mismo sistema que `loss_x`/`loss_y` (el equipo que pierde siempre ataca hacia *x* alto; su portería está en (0, 40)).
+
+> **Disponibilidad de datos 360**: disponibles para Bundesliga 2023/24 y otras competiciones del open data. Si para alguna competición no existiese el fichero, la sección 2 asigna `freeze_lookup = {}` y las variables de zona quedarán como `NaN`.
+
+Variables calculadas:
+
+-   `zone_losing_players` / `zone_transition_players`: número de jugadores de cada equipo dentro del radio.
+-   `zone_player_diff`: `losing − transition` (positivo = el equipo que pierde tiene más defensores en la zona).
+-   `nearest_defender_dist_m`: distancia en metros del defensor más cercano al poseedor del balón.
+-   `defenders_goalside_in_zone`: defensores de la zona cuya distancia al centro de la portería propia es menor que la del poseedor del balón.
+
+```{python}
+# ── Parámetros del área de acción (modificar aquí) ────────────────────────
+RADIUS_METERS = 10.0        # Radio en metros
+
+# Dimensiones reales del campo y escala StatsBomb (campo estándar 105 m × 68 m)
+PITCH_LENGTH_M = 105.0
+PITCH_WIDTH_M  =  68.0
+SB_LENGTH      = 120.0
+SB_WIDTH       =  80.0
+
+# Portería propia en el sistema normalizado del equipo que pierde
+OWN_GOAL_X = 0.0
+OWN_GOAL_Y = 40.0
+
+
+def dist_m(x1, y1, x2, y2):
+    """Distancia euclidea en metros entre dos puntos en coordenadas StatsBomb."""
+    dx = (x2 - x1) * (PITCH_LENGTH_M / SB_LENGTH)
+    dy = (y2 - y1) * (PITCH_WIDTH_M  / SB_WIDTH)
+    return float(np.sqrt(dx**2 + dy**2))
+
+
+_NAN_ZONE = {
+    "zone_losing_players":        np.nan,
+    "zone_transition_players":    np.nan,
+    "zone_player_diff":           np.nan,
+    "nearest_defender_dist_m":    np.nan,
+    "defenders_goalside_in_zone": np.nan,
+}
+
+
+def zone_variables(row):
+    """Calcula las 5 variables del área de acción inmediata para una pérdida."""
+    frame = freeze_lookup.get(_event_key(row.get("turnover_event_id")))
+    if not frame:
+        return _NAN_ZONE.copy()
+
+    ball_x      = row["loss_x"]
+    ball_y      = row["loss_y"]
+    source      = row["turnover_event_source"]
+    need_mirror = source in {"defensive_event", "next_possession_recovery"}
+
+    players = []
+    for p in frame:
+        loc = p.get("location", [np.nan, np.nan])
+        px, py   = float(loc[0]), float(loc[1])
+        if need_mirror:
+            px, py = mirror_x(px), mirror_y(py)
+
+        teammate = bool(p.get("teammate", False))
+        actor    = bool(p.get("actor",    False))
+
+        # Asígnación de equipo en el sistema normalizado del losing_team.
+        # Para defensive_event/next_possession_recovery el actor es transition_team;
+        # para attacking_event el actor es losing_team.
+        if source in {"defensive_event", "next_possession_recovery"}:
+            is_losing = not (teammate or actor)
+        else:
+            is_losing = teammate or actor
+
+        players.append({
+            "x": px, "y": py,
+            "is_losing":    is_losing,
+            "dist_to_ball": dist_m(px, py, ball_x, ball_y),
+        })
+
+    in_zone         = [p for p in players if p["dist_to_ball"] <= RADIUS_METERS]
+    zone_losing     = sum(1 for p in in_zone if     p["is_losing"])
+    zone_transition = sum(1 for p in in_zone if not p["is_losing"])
+
+    losing_in_zone = [p for p in in_zone if p["is_losing"]]
+    nearest_dist   = min((p["dist_to_ball"] for p in losing_in_zone), default=np.nan)
+
+    d_ball_goal    = dist_m(ball_x, ball_y, OWN_GOAL_X, OWN_GOAL_Y)
+    goalside_count = sum(
+        1 for p in losing_in_zone
+        if dist_m(p["x"], p["y"], OWN_GOAL_X, OWN_GOAL_Y) < d_ball_goal
+    )
+
+    return {
+        "zone_losing_players":        zone_losing,
+        "zone_transition_players":    zone_transition,
+        "zone_player_diff":           zone_losing - zone_transition,
+        "nearest_defender_dist_m":    nearest_dist,
+        "defenders_goalside_in_zone": goalside_count,
+    }
+
+
+zone_df       = model_dataset.apply(zone_variables, axis=1, result_type="expand")
+model_dataset = pd.concat(
+    [model_dataset.reset_index(drop=True), zone_df.reset_index(drop=True)], axis=1
+)
+
+cobertura = zone_df["zone_losing_players"].notna().sum()
+print(f"Pérdidas con datos 360: {cobertura:,} / {len(model_dataset):,}")
+model_dataset[[
+    "loss_x", "loss_y",
+    "zone_losing_players", "zone_transition_players", "zone_player_diff",
+    "nearest_defender_dist_m", "defenders_goalside_in_zone",
+]].head(10)
+```
+
+### Visualización — zona de acción inmediata
+
+Para una pérdida seleccionada al azar (con datos 360 disponibles) se muestra el radio de acción, los jugadores de cada equipo, el defensor más cercano al balón y los defensores con ventaja posicional goal-side.
+
+El ejemplo se elige con tres criterios para que sea representativo:
+
+1.  Existe fotograma 360 asociado al evento.
+2.  Hay al menos un jugador (de cualquier equipo) dentro del radio de zona — las pérdidas en zonas completamente despejadas no aportan información visual útil.
+3.  La pérdida ocurre con `loss_x < 90` (zona media o defensiva propia), excluyendo pérdidas en las inmediaciones del área rival donde la zona se desborda fuera del campo.
+
+```{python}
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import Ellipse
+from mplsoccer import Pitch
+
+_BG       = "#0f1923"   # reservado (no usado en viz de fondo claro)
+_PITCH_FC = "white"     # fondo del campo
+_PITCH_LC = "#666666"   # color de líneas del campo
+
+
+def _get_players_for_viz(row):
+    """Extrae y normaliza jugadores del fotograma 360. Reutilizable en sección 8."""
+    frame = freeze_lookup.get(_event_key(row.get("turnover_event_id")))
+    if not frame:
+        return []
+    source      = row["turnover_event_source"]
+    need_mirror = source in {"defensive_event", "next_possession_recovery"}
+    players = []
+    for p in frame:
+        loc = p.get("location", [np.nan, np.nan])
+        px, py = float(loc[0]), float(loc[1])
+        if need_mirror:
+            px, py = mirror_x(px), mirror_y(py)
+        if not (np.isfinite(px) and np.isfinite(py)):
+            continue
+        teammate = bool(p.get("teammate", False))
+        actor    = bool(p.get("actor",    False))
+        keeper   = bool(p.get("keeper",   False))
+        if source in {"defensive_event", "next_possession_recovery"}:
+            is_losing = not (teammate or actor)
+        else:
+            is_losing = teammate or actor
+        players.append({"x": px, "y": py, "is_losing": is_losing,
+                        "keeper": keeper, "actor": actor})
+    return players
+
+
+def _get_visible_area(row):
+    """Polígono del área visible en coordenadas normalizadas, o None.
+
+    StatsBomb almacena visible_area de dos maneras posibles:
+      · Lista plana  [x1, y1, x2, y2, ...]  (JSON bruto del three-sixty)
+      · Lista de pares [[x1,y1], [x2,y2], …] (algunas versiones de statsbombpy)
+    Normalizamos siempre a lista de pares antes de operar.
+    """
+    va = visible_area_lookup.get(_event_key(row.get("turnover_event_id")))
+    if va is None:
+        return None
+    # Normalizar a pares [[x, y], ...]
+    if va and not isinstance(va[0], (list, tuple)):
+        va = [[va[i], va[i + 1]] for i in range(0, len(va) - 1, 2)]
+    if row.get("turnover_event_source") in {"defensive_event", "next_possession_recovery"}:
+        return [[mirror_x(p[0]), mirror_y(p[1])] for p in va]
+    return [list(p) for p in va]
+
+
+def _draw_visible_area(pitch, ax, va_coords, zorder=2):
+    """Resalta el área visible de cámara con pitch.polygon() (estilo soccermatics)."""
+    if va_coords is None or len(va_coords) < 3:
+        return
+    try:
+        va_arr = np.array(va_coords, dtype=float).reshape(-1, 2)
+        pitch.polygon(
+            [va_arr], ax=ax,
+            facecolor="#c5e8c5", alpha=0.40,
+            edgecolor="#388e3c", linewidth=1.8,
+            linestyle="--", zorder=zorder,
+        )
+    except Exception:
+        pass
+
+
+# Filtramos para obtener un ejemplo representativo:
+#   · datos 360 disponibles (zone_losing_players no NaN)
+#   · al menos 1 jugador en el radio de zona (pérdidas en zona despejada no ilustran nada)
+#   · pérdida en zona media/defensiva propia (loss_x < 90) — excluye córneres y ataques extremos
+_zone_sample = model_dataset[
+    model_dataset["zone_losing_players"].notna()
+    & ((model_dataset["zone_losing_players"] + model_dataset["zone_transition_players"]) > 0)
+    & (model_dataset["loss_x"] < 90)
+]
+if _zone_sample.empty:
+    # Si el filtro es demasiado estricto, relajamos solo el requisito de posición
+    _zone_sample = model_dataset[
+        model_dataset["zone_losing_players"].notna()
+        & ((model_dataset["zone_losing_players"] + model_dataset["zone_transition_players"]) > 0)
+    ]
+if _zone_sample.empty:
+    # Último fallback: cualquier pérdida con fotograma 360, aunque no haya jugadores
+    # dentro del radio de acción inmediata.
+    _zone_sample = model_dataset[model_dataset["zone_losing_players"].notna()]
+if _zone_sample.empty:
+    print("⚠ Sin datos 360. Ejecuta con una competición que tenga datos 360.")
+    _VIZ_EVENT_ID = None
+else:
+    _zrow = _zone_sample.sample(1, random_state=42).iloc[0]
+    _VIZ_EVENT_ID = _zrow.get("turnover_event_id")   # reutilizado en sección 8
+    _zp   = _get_players_for_viz(_zrow)
+    _bx, _by = _zrow["loss_x"], _zrow["loss_y"]
+
+    # Métricas de zona
+    _zin      = [p for p in _zp if dist_m(p["x"], p["y"], _bx, _by) <= RADIUS_METERS]
+    _zdef_in  = [p for p in _zin if p["is_losing"]]
+    _znear    = (min(_zdef_in, key=lambda p: dist_m(p["x"], p["y"], _bx, _by))
+                 if _zdef_in else None)
+    _dball    = dist_m(_bx, _by, OWN_GOAL_X, OWN_GOAL_Y)
+    _gs_ids   = {id(p) for p in _zdef_in
+                 if dist_m(p["x"], p["y"], OWN_GOAL_X, OWN_GOAL_Y) < _dball}
+
+    pitch = Pitch(pitch_type="statsbomb", pitch_color=_PITCH_FC,
+                  line_color=_PITCH_LC, goal_type="box", linewidth=1.5)
+    fig, ax = pitch.draw(figsize=(11, 7))
+    fig.patch.set_facecolor(_PITCH_FC)
+    _draw_visible_area(pitch, ax, _get_visible_area(_zrow))
+
+    # Radio de acción: elipse en unidades SB (escala x ≠ escala y en StatsBomb)
+    _rx = RADIUS_METERS / (PITCH_LENGTH_M / SB_LENGTH)
+    _ry = RADIUS_METERS / (PITCH_WIDTH_M  / SB_WIDTH)
+    ax.add_patch(Ellipse((_bx, _by), 2*_rx, 2*_ry,
+                         fill=True, facecolor="gold", alpha=0.12,
+                         edgecolor="gold", linewidth=2, linestyle="--", zorder=3))
+
+    # Todos los jugadores (fuera de zona: semitransparentes)
+    for p in _zp:
+        c = "#90caf9" if p["is_losing"] else "#ef9a9a"
+        m = "s" if p["keeper"] else "o"
+        ax.scatter(p["x"], p["y"], c=c, s=170, marker=m, zorder=4,
+                   edgecolors="none", alpha=0.55)
+
+    # Jugadores en zona (opacos)
+    for p in _zin:
+        c = "#1565c0" if p["is_losing"] else "#c62828"
+        m = "s" if p["keeper"] else "o"
+        ax.scatter(p["x"], p["y"], c=c, s=290, marker=m, zorder=5,
+                   edgecolors="#333333", linewidths=1.2)
+
+    # Anillo verde: defensores con ventaja posicional goal-side
+    for p in _zdef_in:
+        if id(p) in _gs_ids:
+            ax.scatter(p["x"], p["y"], s=480, facecolors="none",
+                       edgecolors="#69f0ae", linewidths=2.5, zorder=6)
+
+    # Defensor más cercano: estrella dorada + línea + etiqueta de distancia
+    if _znear:
+        _d_near = dist_m(_znear["x"], _znear["y"], _bx, _by)
+        ax.plot([_bx, _znear["x"]], [_by, _znear["y"]],
+                color="gold", linestyle="--", linewidth=1.5, alpha=0.8, zorder=5)
+        ax.scatter(_znear["x"], _znear["y"], s=560, marker="*",
+                   c="gold", edgecolors="black", linewidths=1, zorder=7)
+        ax.annotate(f"{_d_near:.1f} m", xy=(_znear["x"], _znear["y"]),
+                    xytext=(6, 8), textcoords="offset points",
+                    color="gold", fontsize=10, fontweight="bold")
+
+    # Nuevo poseedor: jugador del equipo que RECUPERA (is_losing=False) más cercano al balón.
+    # Es quien acaba de ganar la posesión (bloqueador, interceptador, etc.)
+    _transition_of = [p for p in _zp if not p["is_losing"] and not p["keeper"]]
+    _possessor_p   = (min(_transition_of, key=lambda p: dist_m(p["x"], p["y"], _bx, _by))
+                     if _transition_of else None)
+    if _possessor_p:
+        ax.scatter(_possessor_p["x"], _possessor_p["y"], c="#ff9800", s=420, marker="o",
+                   zorder=9, edgecolors="black", linewidths=2)
+
+    # Balón — más pequeño que el círculo naranja para que el poseedor sea visible
+    ax.scatter(_bx, _by, s=180, c="white", edgecolors="black", linewidths=2, zorder=10)
+    ax.annotate("Balón", xy=(_bx, _by), xytext=(5, -14),
+                textcoords="offset points", color="#1a1a1a", fontsize=9, fontweight="bold")
+    ax.scatter(OWN_GOAL_X, OWN_GOAL_Y, s=260, c="#888888",
+               marker="*", zorder=7, edgecolors="#444444")
+
+    legend_handles = [
+        mpatches.Patch(color="#1565c0",
+                       label=f"Defensor en zona ({_zrow['losing_team']})"),
+        mpatches.Patch(color="#c62828",
+                       label=f"Atacante en zona ({_zrow['transition_team']})"),
+        mpatches.Patch(color="#90caf9", alpha=0.7, label="Fuera de zona (defensor)"),
+        mpatches.Patch(color="#ef9a9a", alpha=0.7, label="Fuera de zona (atacante)"),
+        plt.Line2D([0], [0], marker="o", color="k", markerfacecolor="none",
+                   markeredgecolor="#2e7d32", markeredgewidth=2.5, markersize=11,
+                   label="Defensor goal-side"),
+        plt.Line2D([0], [0], marker="*", color="k", markerfacecolor="gold",
+                   markersize=13, label="Defensor más cercano"),
+        mpatches.Patch(color="#ff9800", label="Nuevo poseedor (recuperación)"),
+        mpatches.Patch(facecolor="#c5e8c5", alpha=0.90, edgecolor="#388e3c",
+                       label="Área visible de cámara"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper right", framealpha=0.95,
+              fontsize=9, facecolor="white", labelcolor="#1a1a1a", edgecolor="#cccccc")
+    ax.set_title(
+        f"Zona de acción inmediata  ·  "
+        f"{_zrow['losing_team']} vs {_zrow['transition_team']}  "
+        f"|  Acción: {_zrow['turnover_action_type']}\n"
+        f"Radio: {RADIUS_METERS} m  |  "
+        f"Def. en zona: {int(_zrow['zone_losing_players'])}  |  "
+        f"Atac. en zona: {int(_zrow['zone_transition_players'])}  |  "
+        f"Def. goal-side: {int(_zrow['defenders_goalside_in_zone'])}",
+        color="#1a1a1a", fontsize=11, pad=10,
+    )
+    plt.tight_layout()
+    plt.show()
+```
+
+## 8. Variables de la última línea defensiva
+
+La **vigilancia ofensiva** mide en qué medida la última línea defensiva puede controlar el espacio más peligroso en el momento de la pérdida: el rectángulo inmediatamente delante de los últimos defensores, desde el que un atacante puede progresar hacia portería sin encontrar oposición.
+
+### Definición de la zona
+
+Partiendo del fotograma 360, localizamos al **último defensor de campo** del equipo que pierde (el jugador con menor *x* en el sistema normalizado, excluyendo el portero). Su coordenada *x* marca el borde interior de la zona. Desde ahí, la zona se extiende `LAST_LINE_DEPTH_METERS` metros en dirección *x* creciente (hacia el campo del equipo atacante), con todo el ancho del campo en *y*.
+
+### Variables calculadas
+
+**a) `last_def_dist_to_goal_m`** Distancia en metros del último defensor de campo al centro de la portería propia (0, 40). Mide la profundidad de la línea: cuanto mayor, más espacio hay a explotar a sus espaldas.
+
+**b) `last_line_losing_players` / `last_line_transition_players`** Número de jugadores de cada equipo dentro de la zona de última línea. El portero se excluye del conteo defensor; todos los atacantes visibles se incluyen.
+
+**c) `last_line_player_diff`** `losing − transition`. Positivo: el equipo que defiende la transición tiene más jugadores en la zona. Negativo: está en inferioridad numérica en ese espacio crítico.
+
+**d.1) `last_line_def_area_ratio` — Control territorial (Voronoi)** Se construye un diagrama de Voronoi usando **todos** los jugadores visibles del fotograma (no solo los de la zona). Usar todos los jugadores evita los artefactos de borde que ocurren cuando hay pocos jugadores en la zona: las celdas se extienden correctamente hasta los límites del campo gracias al *reflection trick* (cada punto se refleja en las cuatro líneas del campo antes de calcular Voronoi, técnica popularizada por Dan Nichol). Las celdas resultantes se recortan al rectángulo de la última línea con `shapely`. El ratio *área defensores / área total* expresa qué fracción del espacio crítico controla el equipo que defiende: `1.0` = control total, `0.0` = espacio completamente libre para el rival.
+
+**d.2) `last_line_avg_marking_dist_m` — Presión de marcaje** Para cada atacante dentro de la zona, se calcula la distancia al defensor visible más cercano (buscando en todo el campo, no solo en la zona). El promedio de estas distancias captura si los atacantes en la zona están bien marcados o tienen libertad de movimiento. Complementa el ratio Voronoi: puede haber equilibrio territorial pero con atacantes alejados de sus marcadores, lo que aumenta el peligro real de la transición.
+
+```{python}
+# ── Parámetros de la última línea (modificar aquí) ────────────────────────
+LAST_LINE_DEPTH_METERS = 10.0   # Profundidad de la zona en metros
+
+LAST_LINE_DEPTH_SB = LAST_LINE_DEPTH_METERS * (SB_LENGTH / PITCH_LENGTH_M)
+
+from scipy.spatial import Voronoi as _Voronoi
+from shapely.geometry import Polygon as _Polygon
+from shapely.errors import GEOSException
+
+
+def _reflect_2d(pts):
+    """Reflection trick: refleja puntos en los 4 bordes del campo para Voronoi."""
+    x0, x1, y0, y1 = 0.0, SB_LENGTH, 0.0, SB_WIDTH
+    return np.vstack([
+        pts,
+        np.column_stack([2*x0 - pts[:, 0], pts[:, 1]]),
+        np.column_stack([2*x1 - pts[:, 0], pts[:, 1]]),
+        np.column_stack([pts[:, 0], 2*y0 - pts[:, 1]]),
+        np.column_stack([pts[:, 0], 2*y1 - pts[:, 1]]),
+    ])
+
+
+def _voronoi_area_ratio(players, zone_poly):
+    """
+    Fracción del área de zone_poly controlada por el equipo que pierde (losing_team).
+    Tesela con todos los jugadores visibles para evitar artefactos de borde.
+    """
+    if len(players) < 2:
+        return np.nan
+
+    coords    = np.array([[p["x"], p["y"]] for p in players])
+    is_losing = np.array([p["is_losing"] for p in players])
+    n         = len(players)
+
+    try:
+        vor = _Voronoi(_reflect_2d(coords))
+    except Exception:
+        return np.nan
+
+    def_area   = 0.0
+    total_area = 0.0
+
+    for i in range(n):
+        region = vor.regions[vor.point_region[i]]
+        if -1 in region or len(region) < 3:
+            continue
+        try:
+            poly    = _Polygon(vor.vertices[region])
+            clipped = poly.intersection(zone_poly)
+            if not clipped.is_valid or clipped.is_empty:
+                continue
+            area = clipped.area
+            if is_losing[i]:
+                def_area += area
+            total_area += area
+        except (GEOSException, Exception):
+            continue
+
+    return def_area / total_area if total_area > 0 else np.nan
+
+
+_NAN_LL = {
+    "last_def_dist_to_goal_m":      np.nan,
+    "last_line_losing_players":     np.nan,
+    "last_line_transition_players": np.nan,
+    "last_line_player_diff":        np.nan,
+    "last_line_def_area_ratio":     np.nan,
+    "last_line_avg_marking_dist_m": np.nan,
+}
+
+
+_NAN_CORRIDOR = {
+    "loss_dist_to_own_goal_m":          np.nan,
+    "loss_angle_to_own_goal_rad":       np.nan,
+    "corridor_losing_players":          np.nan,
+    "corridor_transition_players":      np.nan,
+    "corridor_player_diff":             np.nan,
+    "corridor_def_area_ratio":          np.nan,
+    "corridor_avg_marking_dist_m":      np.nan,
+    "corridor_nearest_defender_dist_m": np.nan,
+}
+
+
+def goal_angle_to_own_goal(x, y):
+    """Ángulo visible de la portería propia desde el punto de pérdida."""
+    x_m = max(float(x), 1e-6) * (PITCH_LENGTH_M / SB_LENGTH)
+    c_m = abs(float(y) - OWN_GOAL_Y) * (PITCH_WIDTH_M / SB_WIDTH)
+    goal_width_m = 7.32
+    denom = x_m**2 + c_m**2 - (goal_width_m / 2) ** 2
+    angle = np.arctan(goal_width_m * x_m / denom) if denom != 0 else np.pi / 2
+    return float(angle if angle > 0 else angle + np.pi)
+
+
+def corridor_polygon(ball_x):
+    """Espacio que puede atacar el rival entre la pérdida y la portería propia."""
+    bx = max(0.0, min(SB_LENGTH, float(ball_x)))
+    if bx <= 1e-6:
+        return None
+    return _Polygon([(0.0, 0.0), (bx, 0.0), (bx, SB_WIDTH), (0.0, SB_WIDTH)])
+
+
+def corridor_variables(row):
+    """Variables del corredor de transición entre pérdida y portería propia."""
+    frame = freeze_lookup.get(_event_key(row.get("turnover_event_id")))
+    if not frame:
+        out = _NAN_CORRIDOR.copy()
+        out["loss_dist_to_own_goal_m"] = dist_m(row["loss_x"], row["loss_y"], OWN_GOAL_X, OWN_GOAL_Y)
+        out["loss_angle_to_own_goal_rad"] = goal_angle_to_own_goal(row["loss_x"], row["loss_y"])
+        return out
+
+    bx, by = row["loss_x"], row["loss_y"]
+    poly = corridor_polygon(bx)
+    if poly is None:
+        return _NAN_CORRIDOR.copy()
+
+    source = row["turnover_event_source"]
+    need_mirror = source in {"defensive_event", "next_possession_recovery"}
+
+    players = []
+    for p in frame:
+        loc = p.get("location", [np.nan, np.nan])
+        px, py = float(loc[0]), float(loc[1])
+        if need_mirror:
+            px, py = mirror_x(px), mirror_y(py)
+        if not (np.isfinite(px) and np.isfinite(py)):
+            continue
+
+        teammate = bool(p.get("teammate", False))
+        actor = bool(p.get("actor", False))
+        keeper = bool(p.get("keeper", False))
+        is_losing = not (teammate or actor) if need_mirror else (teammate or actor)
+        players.append({"x": px, "y": py, "is_losing": is_losing, "keeper": keeper})
+
+    in_corridor = [p for p in players if 0.0 <= p["x"] <= bx]
+    defenders = [p for p in in_corridor if p["is_losing"] and not p["keeper"]]
+    attackers = [p for p in in_corridor if not p["is_losing"]]
+    all_outfield = [p for p in players if not p["keeper"]]
+
+    def_area_ratio = _voronoi_area_ratio(all_outfield, poly)
+    nearest_def = min((dist_m(p["x"], p["y"], bx, by) for p in defenders), default=np.nan)
+
+    if attackers and defenders:
+        avg_marking = float(np.mean([
+            min(dist_m(a["x"], a["y"], d["x"], d["y"]) for d in defenders)
+            for a in attackers
+        ]))
+    else:
+        avg_marking = np.nan
+
+    return {
+        "loss_dist_to_own_goal_m":          dist_m(bx, by, OWN_GOAL_X, OWN_GOAL_Y),
+        "loss_angle_to_own_goal_rad":       goal_angle_to_own_goal(bx, by),
+        "corridor_losing_players":          len(defenders),
+        "corridor_transition_players":      len(attackers),
+        "corridor_player_diff":             len(defenders) - len(attackers),
+        "corridor_def_area_ratio":          def_area_ratio,
+        "corridor_avg_marking_dist_m":      avg_marking,
+        "corridor_nearest_defender_dist_m": nearest_def,
+    }
+
+
+def last_line_variables(row):
+    """Calcula las 6 variables de la última línea defensiva para una pérdida."""
+    frame = freeze_lookup.get(_event_key(row.get("turnover_event_id")))
+    if not frame:
+        return _NAN_LL.copy()
+
+    source      = row["turnover_event_source"]
+    need_mirror = source in {"defensive_event", "next_possession_recovery"}
+
+    players = []
+    for p in frame:
+        loc = p.get("location", [np.nan, np.nan])
+        px, py = float(loc[0]), float(loc[1])
+        if need_mirror:
+            px, py = mirror_x(px), mirror_y(py)
+        if not (np.isfinite(px) and np.isfinite(py)):
+            continue
+
+        teammate = bool(p.get("teammate", False))
+        actor    = bool(p.get("actor",    False))
+        keeper   = bool(p.get("keeper",   False))
+
+        if source in {"defensive_event", "next_possession_recovery"}:
+            is_losing = not (teammate or actor)
+        else:
+            is_losing = teammate or actor
+
+        players.append({
+            "x": px, "y": py,
+            "is_losing": is_losing,
+            "keeper":    keeper,
+        })
+
+    # Último defensor de campo (excluir portero)
+    outfield_defenders = [p for p in players if p["is_losing"] and not p["keeper"]]
+    if not outfield_defenders:
+        return _NAN_LL.copy()
+
+    last_def   = min(outfield_defenders, key=lambda p: p["x"])
+    last_def_x = last_def["x"]
+
+    # a) Distancia último defensor → portería propia
+    last_def_dist_goal = dist_m(last_def["x"], last_def["y"], OWN_GOAL_X, OWN_GOAL_Y)
+
+    # Zona: [last_def_x, last_def_x + LAST_LINE_DEPTH_SB] × [0, SB_WIDTH]
+    zone_x_max = min(last_def_x + LAST_LINE_DEPTH_SB, SB_LENGTH)
+    zone_poly  = _Polygon([
+        (last_def_x, 0),
+        (zone_x_max, 0),
+        (zone_x_max, SB_WIDTH),
+        (last_def_x, SB_WIDTH),
+    ])
+
+    # b) Jugadores en zona (porteros excluidos del lado defensor)
+    in_zone_losing     = [
+        p for p in players
+        if p["is_losing"] and not p["keeper"]
+        and last_def_x <= p["x"] <= zone_x_max
+    ]
+    in_zone_transition = [
+        p for p in players
+        if not p["is_losing"]
+        and last_def_x <= p["x"] <= zone_x_max
+    ]
+
+    # d.1) Voronoi con todos los jugadores (excl. porteros), clipeado a zona
+    players_for_vor = [p for p in players if not p["keeper"]]
+    def_area_ratio  = _voronoi_area_ratio(players_for_vor, zone_poly)
+
+    # d.2) Distancia media de marcaje para atacantes en zona
+    if in_zone_transition:
+        defenders_all = [p for p in players if p["is_losing"] and not p["keeper"]]
+        if defenders_all:
+            marking_dists = [
+                min(dist_m(att["x"], att["y"], d["x"], d["y"]) for d in defenders_all)
+                for att in in_zone_transition
+            ]
+            avg_marking = float(np.mean(marking_dists))
+        else:
+            avg_marking = np.nan
+    else:
+        avg_marking = np.nan
+
+    return {
+        "last_def_dist_to_goal_m":      last_def_dist_goal,
+        "last_line_losing_players":     len(in_zone_losing),
+        "last_line_transition_players": len(in_zone_transition),
+        "last_line_player_diff":        len(in_zone_losing) - len(in_zone_transition),
+        "last_line_def_area_ratio":     def_area_ratio,
+        "last_line_avg_marking_dist_m": avg_marking,
+    }
+
+
+ll_df         = model_dataset.apply(last_line_variables, axis=1, result_type="expand")
+model_dataset = pd.concat(
+    [model_dataset.reset_index(drop=True), ll_df.reset_index(drop=True)], axis=1
+)
+
+corridor_df   = model_dataset.apply(corridor_variables, axis=1, result_type="expand")
+model_dataset = pd.concat(
+    [model_dataset.reset_index(drop=True), corridor_df.reset_index(drop=True)], axis=1
+)
+
+cobertura_ll = ll_df["last_def_dist_to_goal_m"].notna().sum()
+print(f"Pérdidas con datos de última línea: {cobertura_ll:,} / {len(model_dataset):,}")
+print(f"Pérdidas con corredor de transición: "
+      f"{corridor_df['corridor_losing_players'].notna().sum():,} / {len(model_dataset):,}")
+model_dataset[[
+    "loss_x", "loss_y",
+    "last_def_dist_to_goal_m",
+    "last_line_losing_players", "last_line_transition_players", "last_line_player_diff",
+    "last_line_def_area_ratio", "last_line_avg_marking_dist_m",
+    "corridor_player_diff", "corridor_def_area_ratio", "corridor_avg_marking_dist_m",
+]].head(10)
+```
+
+### Visualización — última línea y control Voronoi
+
+Figura de dos paneles sobre la misma jugada seleccionada en la sección 7. El panel izquierdo muestra la zona de última línea con todos los jugadores identificados; el derecho superpone las celdas Voronoi clipeadas a la zona para mostrar el control territorial.
+
+```{python}
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import Rectangle
+from mplsoccer import Pitch
+from scipy.spatial import Voronoi as _VorViz
+from shapely.geometry import Polygon as _PolyViz, MultiPolygon as _MPolyViz
+from shapely.errors import GEOSException
+
+_BG = "#0f1923"
+
+# Usamos la misma jugada que la zona (sección 7) si fue calculada; si no, muestreamos.
+_ll_pool = model_dataset[model_dataset["last_def_dist_to_goal_m"].notna()]
+if _ll_pool.empty:
+    print("⚠ Sin datos 360.")
+else:
+    if _VIZ_EVENT_ID is not None and "turnover_event_id" in _ll_pool.columns:
+        _cand = _ll_pool[_ll_pool["turnover_event_id"] == _VIZ_EVENT_ID]
+        _llrow = _cand.iloc[0] if not _cand.empty else _ll_pool.sample(1, random_state=42).iloc[0]
+    else:
+        _llrow = _ll_pool.sample(1, random_state=42).iloc[0]
+
+    _llp = _get_players_for_viz(_llrow)
+    _ll_bx, _ll_by = _llrow["loss_x"], _llrow["loss_y"]
+
+    # Último defensor de campo
+    _ll_defs  = [p for p in _llp if p["is_losing"] and not p["keeper"]]
+    _last_def = min(_ll_defs, key=lambda p: p["x"]) if _ll_defs else None
+
+    if _last_def is None:
+        print("⚠ No se encontró último defensor en esta jugada.")
+    else:
+        _ldx     = _last_def["x"]
+        _zxmax   = min(_ldx + LAST_LINE_DEPTH_SB, SB_LENGTH)
+        _in_def  = [p for p in _llp
+                    if p["is_losing"] and not p["keeper"] and _ldx <= p["x"] <= _zxmax]
+        _in_att  = [p for p in _llp
+                    if not p["is_losing"] and _ldx <= p["x"] <= _zxmax]
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+        fig.patch.set_facecolor(_PITCH_FC)
+
+        # ── PANEL IZQUIERDO: zona de última línea ──────────────────────────
+        pitch_l = Pitch(pitch_type="statsbomb", pitch_color=_PITCH_FC,
+                        line_color=_PITCH_LC, goal_type="box", linewidth=1.5)
+        pitch_l.draw(ax=axes[0])
+        _draw_visible_area(pitch_l, axes[0], _get_visible_area(_llrow))
+
+        # Zona de última línea (rectángulo cian, borde destacado)
+        axes[0].add_patch(Rectangle(
+            (_ldx, 0), _zxmax - _ldx, SB_WIDTH,
+            facecolor="#00bcd4", alpha=0.16, edgecolor="#00bcd4", linewidth=3, zorder=2,
+        ))
+        # Línea vertical del último defensor
+        axes[0].axvline(_ldx, color="#00bcd4", linestyle="--",
+                        linewidth=2, alpha=0.75, zorder=3)
+
+        # Zona de acción inmediata (elipse dorada) — contexto del punto de pérdida
+        _rx_ll = RADIUS_METERS / (PITCH_LENGTH_M / SB_LENGTH)
+        _ry_ll = RADIUS_METERS / (PITCH_WIDTH_M  / SB_WIDTH)
+        axes[0].add_patch(Ellipse((_ll_bx, _ll_by), 2*_rx_ll, 2*_ry_ll,
+                                  fill=True, facecolor="gold", alpha=0.11,
+                                  edgecolor="gold", linewidth=2, linestyle="--", zorder=3))
+
+        # Balón (punto de pérdida) — más pequeño que el círculo del poseedor
+        axes[0].scatter(_ll_bx, _ll_by, s=180, c="white", edgecolors="black",
+                        linewidths=2, zorder=9)
+        axes[0].annotate("Balón", xy=(_ll_bx, _ll_by), xytext=(5, -14),
+                         textcoords="offset points", color="white",
+                         fontsize=8.5, fontweight="bold")
+
+        # Todos los jugadores (fuera de zona: semitransparentes)
+        for p in _llp:
+            c = "#90caf9" if p["is_losing"] else "#ef9a9a"
+            m = "s" if p["keeper"] else "o"
+            axes[0].scatter(p["x"], p["y"], c=c, s=180, marker=m, zorder=4,
+                            edgecolors="none", alpha=0.55)
+
+        # Jugadores en zona (opacos)
+        for p in _in_def:
+            axes[0].scatter(p["x"], p["y"], c="#1976d2", s=290, marker="o",
+                            zorder=5, edgecolors="white", linewidths=1.5)
+        for p in _in_att:
+            axes[0].scatter(p["x"], p["y"], c="#d32f2f", s=290, marker="o",
+                            zorder=5, edgecolors="white", linewidths=1.5)
+
+        # Nuevo poseedor: jugador del equipo que recupera (is_losing=False) más cercano al balón
+        _ll_transition_of = [p for p in _llp if not p["is_losing"] and not p["keeper"]]
+        _possessor_ll     = (min(_ll_transition_of, key=lambda p: dist_m(p["x"], p["y"], _ll_bx, _ll_by))
+                            if _ll_transition_of else None)
+        if _possessor_ll:
+            axes[0].scatter(_possessor_ll["x"], _possessor_ll["y"], c="#ff9800", s=360,
+                            marker="o", zorder=8, edgecolors="black", linewidths=2)
+
+        # Último defensor (estrella dorada)
+        axes[0].scatter(_last_def["x"], _last_def["y"], s=580, marker="*",
+                        c="gold", edgecolors="black", linewidths=1, zorder=9)
+
+        # Distancia portería → último defensor
+        _dg = dist_m(_last_def["x"], _last_def["y"], OWN_GOAL_X, OWN_GOAL_Y)
+        axes[0].plot([OWN_GOAL_X, _last_def["x"]], [OWN_GOAL_Y, _last_def["y"]],
+                     color="gold", linestyle=":", linewidth=1.5, alpha=0.7, zorder=4)
+        axes[0].annotate(f"{_dg:.1f} m",
+                         xy=((_last_def["x"] + OWN_GOAL_X) / 2,
+                             (_last_def["y"] + OWN_GOAL_Y) / 2),
+                         color="gold", fontsize=10, fontweight="bold",
+                         ha="center", va="bottom")
+
+        # Portería propia
+        axes[0].scatter(OWN_GOAL_X, OWN_GOAL_Y, s=260, c="white",
+                        marker="*", zorder=7, edgecolors="#aaaaaa")
+
+        legend_l = [
+            mpatches.Patch(color="#1565c0",
+                           label=f"Defensor en zona ({_llrow['losing_team']})"),
+            mpatches.Patch(color="#c62828",
+                           label=f"Atacante en zona ({_llrow['transition_team']})"),
+            mpatches.Patch(color="#90caf9", alpha=0.7, label="Fuera de zona (defensor)"),
+            mpatches.Patch(color="#ef9a9a", alpha=0.7, label="Fuera de zona (atacante)"),
+            plt.Line2D([0], [0], marker="*", color="k", markerfacecolor="gold",
+                       markersize=14, label="Último defensor"),
+            mpatches.Patch(facecolor="#00bcd4", alpha=0.25, edgecolor="#00bcd4",
+                           label=f"Zona última línea ({LAST_LINE_DEPTH_METERS} m)"),
+            mpatches.Patch(facecolor="gold", alpha=0.18, edgecolor="gold",
+                           linestyle="--", label=f"Zona inmediata ({RADIUS_METERS} m)"),
+            mpatches.Patch(color="#ff9800", label="Nuevo poseedor (recuperación)"),
+            mpatches.Patch(facecolor="#c5e8c5", alpha=0.90, edgecolor="#388e3c",
+                           label="Área visible de cámara"),
+        ]
+        axes[0].legend(handles=legend_l, loc="upper right", framealpha=0.95,
+                       fontsize=8.5, facecolor="white",
+                       labelcolor="#1a1a1a", edgecolor="#cccccc")
+        axes[0].set_title(
+            f"Última línea defensiva  ·  "
+            f"{_llrow['losing_team']} vs {_llrow['transition_team']}\n"
+            f"Def. en zona: {int(_llrow['last_line_losing_players'])}  |  "
+            f"Atac. en zona: {int(_llrow['last_line_transition_players'])}  |  "
+            f"Dist. portería: {_llrow['last_def_dist_to_goal_m']:.1f} m",
+            color="#1a1a1a", fontsize=10, pad=8,
+        )
+
+        # ── PANEL DERECHO: celdas Voronoi clipeadas a la zona ─────────────
+        pitch_r = Pitch(pitch_type="statsbomb", pitch_color=_PITCH_FC,
+                        line_color=_PITCH_LC, goal_type="box", linewidth=1.5)
+        pitch_r.draw(ax=axes[1])
+        _draw_visible_area(pitch_r, axes[1], _get_visible_area(_llrow))
+
+        _vp      = [p for p in _llp if not p["keeper"]]
+        _zone_pv = _PolyViz([(_ldx, 0), (_zxmax, 0), (_zxmax, SB_WIDTH), (_ldx, SB_WIDTH)])
+
+        if len(_vp) >= 2:
+            _vc  = np.array([[p["x"], p["y"]] for p in _vp])
+            _vil = np.array([p["is_losing"] for p in _vp])
+            try:
+                _vor = _VorViz(_reflect_2d(_vc))
+                for i in range(len(_vp)):
+                    region = _vor.regions[_vor.point_region[i]]
+                    if -1 in region or len(region) < 3:
+                        continue
+                    try:
+                        _cell = _PolyViz(_vor.vertices[region])
+                        _clip = _cell.intersection(_zone_pv)
+                        if _clip.is_empty:
+                            continue
+                        geoms = (_clip.geoms if isinstance(_clip, _MPolyViz)
+                                 else [_clip])
+                        for geom in geoms:
+                            _xy    = np.array(geom.exterior.coords)
+                            c_fill = "#bbdefb" if _vil[i] else "#ffcdd2"
+                            c_edge = "#1565c0" if _vil[i] else "#c62828"
+                            axes[1].fill(_xy[:, 0], _xy[:, 1],
+                                         color=c_fill, alpha=0.7, zorder=3)
+                            axes[1].plot(_xy[:, 0], _xy[:, 1],
+                                         color=c_edge, linewidth=0.8, zorder=4)
+                    except (GEOSException, Exception):
+                        continue
+            except Exception as _ve:
+                axes[1].text(60, 40, f"Error Voronoi:\n{_ve}",
+                             ha="center", va="center", fontsize=9, color="red")
+
+        # Contorno de zona última línea sobre Voronoi (borde cian)
+        axes[1].add_patch(Rectangle(
+            (_ldx, 0), _zxmax - _ldx, SB_WIDTH,
+            fill=False, edgecolor="#00bcd4", linewidth=3, zorder=5,
+        ))
+
+        # Zona de acción inmediata (solo contorno) en panel Voronoi
+        axes[1].add_patch(Ellipse((_ll_bx, _ll_by), 2*_rx_ll, 2*_ry_ll,
+                                  fill=False,
+                                  edgecolor="gold", linewidth=2, linestyle="--", zorder=5))
+
+        # Balón en panel Voronoi
+        axes[1].scatter(_ll_bx, _ll_by, s=180, c="white", edgecolors="black",
+                        linewidths=2, zorder=8)
+
+        # Jugadores sobre las celdas
+        for p in _vp:
+            c     = "#1565c0" if p["is_losing"] else "#c62828"
+            in_z  = _ldx <= p["x"] <= _zxmax
+            axes[1].scatter(p["x"], p["y"], c=c, s=260 if in_z else 150,
+                            zorder=6,
+                            edgecolors="black" if in_z else "gray",
+                            linewidths=1.5 if in_z else 0.8,
+                            alpha=1.0 if in_z else 0.5)
+
+        # Último defensor
+        axes[1].scatter(_last_def["x"], _last_def["y"], s=500, marker="*",
+                        c="gold", edgecolors="black", linewidths=1, zorder=7)
+
+        _dr   = _llrow["last_line_def_area_ratio"]
+        _am   = _llrow["last_line_avg_marking_dist_m"]
+        _dr_s = f"{_dr:.1%}" if np.isfinite(_dr) else "N/A"
+        _am_s = f"{_am:.1f} m" if np.isfinite(_am) else "N/A"
+
+        legend_r = [
+            mpatches.Patch(color="#bbdefb", edgecolor="#1565c0",
+                           label=f"Control defensor ({_llrow['losing_team']})"),
+            mpatches.Patch(color="#ffcdd2", edgecolor="#c62828",
+                           label=f"Control atacante ({_llrow['transition_team']})"),
+            mpatches.Patch(facecolor="none", edgecolor="#00bcd4", linewidth=3,
+                           label=f"Zona última línea ({LAST_LINE_DEPTH_METERS} m)"),
+            mpatches.Patch(facecolor="none", edgecolor="gold", linewidth=2,
+                           linestyle="--", label=f"Zona inmediata ({RADIUS_METERS} m)"),
+            plt.Line2D([0], [0], marker="*", color="k", markerfacecolor="gold",
+                       markersize=14, label="Último defensor"),
+            mpatches.Patch(facecolor="#c5e8c5", alpha=0.90, edgecolor="#388e3c",
+                           label="Área visible de cámara"),
+        ]
+        axes[1].legend(handles=legend_r, loc="upper right", framealpha=0.95,
+                       fontsize=8.5, facecolor="white",
+                       labelcolor="#1a1a1a", edgecolor="#cccccc")
+        axes[1].set_title(
+            f"Control territorial Voronoi  ·  Zona última línea\n"
+            f"Ratio control defensivo: {_dr_s}  |  "
+            f"Dist. media marcaje: {_am_s}",
+            color="#1a1a1a", fontsize=10, pad=8,
+        )
+
+        plt.suptitle(
+            f"Última línea defensiva — jugada #{int(_llrow['lost_possession'])} "
+            f"(min {_llrow['action_minute']:.0f}')",
+            color="#1a1a1a", fontsize=13, y=1.01,
+        )
+        plt.tight_layout()
+        plt.show()
+```
+
+### Visualización unificada — zona inmediata, última línea y Voronoi
+
+Un único campo integra toda la información espacial de la jugada:
+
+-   **Elipse dorada** (zona de acción inmediata): jugadores opacos dentro, transparentes fuera; estrella dorada = defensor más cercano al balón.
+-   **Rectángulo cian** con fondo Voronoi (zona de última línea): celdas azules = control defensor, rojas = control atacante; estrella cian = último defensor de campo.
+-   **Círculo naranja**: nuevo poseedor — jugador del equipo que recupera el balón (`is_losing=False`) más cercano al punto de pérdida.
+-   **Círculo blanco grande**: posición del balón (punto de pérdida).
+
+```{python}
+try:
+    # Verifica que las secciones 7 y 8 hayan generado las variables necesarias
+    _ = _last_def, _ldx, _zxmax, _rx_ll, _ry_ll
+    assert _VIZ_EVENT_ID is not None, "Sin datos 360 (ejecuta sección 7)"
+    assert _last_def is not None, "Sin último defensor (ejecuta sección 8)"
+    _unified_ok = True
+except (NameError, AssertionError) as _ue:
+    print(f"⚠ {_ue}")
+    _unified_ok = False
+
+if _unified_ok:
+    _up = _get_players_for_viz(_zrow)   # misma jugada, player list fresca
+
+    pitch = Pitch(pitch_type="statsbomb", pitch_color=_PITCH_FC,
+                  line_color=_PITCH_LC, goal_type="box", linewidth=1.5)
+    fig, ax = pitch.draw(figsize=(11, 6.5))
+    fig.patch.set_facecolor(_PITCH_FC)
+    _draw_visible_area(pitch, ax, _get_visible_area(_zrow))
+
+    # 1. Voronoi clipeado a zona de última línea (capa base)
+    _uvp   = [p for p in _up if not p["keeper"]]
+    _upoly = _PolyViz([(_ldx, 0), (_zxmax, 0), (_zxmax, SB_WIDTH), (_ldx, SB_WIDTH)])
+    if len(_uvp) >= 2:
+        _uvc  = np.array([[p["x"], p["y"]] for p in _uvp])
+        _uvil = np.array([p["is_losing"] for p in _uvp])
+        try:
+            _uvor = _VorViz(_reflect_2d(_uvc))
+            for i in range(len(_uvp)):
+                region = _uvor.regions[_uvor.point_region[i]]
+                if -1 in region or len(region) < 3:
+                    continue
+                try:
+                    _ucell = _PolyViz(_uvor.vertices[region])
+                    _uclip = _ucell.intersection(_upoly)
+                    if _uclip.is_empty:
+                        continue
+                    _ugeoms = _uclip.geoms if isinstance(_uclip, _MPolyViz) else [_uclip]
+                    for geom in _ugeoms:
+                        _uxy   = np.array(geom.exterior.coords)
+                        cfill  = "#0d2b4d" if _uvil[i] else "#4d0d0d"
+                        cedge  = "#1565c0" if _uvil[i] else "#c62828"
+                        ax.fill(_uxy[:, 0], _uxy[:, 1], color=cfill, alpha=0.70, zorder=2)
+                        ax.plot(_uxy[:, 0], _uxy[:, 1], color=cedge, linewidth=0.9, zorder=3)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    # 2. Zona de última línea (borde cian)
+    ax.add_patch(Rectangle((_ldx, 0), _zxmax - _ldx, SB_WIDTH,
+                            facecolor="#00bcd4", alpha=0.10, edgecolor="#00bcd4",
+                            linewidth=3, zorder=3))
+    ax.axvline(_ldx, color="#00bcd4", linestyle="--", linewidth=1.8, alpha=0.65, zorder=3)
+
+    # 3. Zona de acción inmediata (elipse dorada)
+    ax.add_patch(Ellipse((_bx, _by), 2*_rx_ll, 2*_ry_ll,
+                         fill=True, facecolor="gold", alpha=0.14,
+                         edgecolor="gold", linewidth=2.5, linestyle="--", zorder=4))
+
+    # 4. Jugadores fuera de ambas zonas (muy transparentes)
+    for p in _up:
+        _in_imm = dist_m(p["x"], p["y"], _bx, _by) <= RADIUS_METERS
+        _in_ll  = _ldx <= p["x"] <= _zxmax
+        if _in_imm or _in_ll:
+            continue
+        c = "#90caf9" if p["is_losing"] else "#ef9a9a"
+        m = "s" if p["keeper"] else "o"
+        ax.scatter(p["x"], p["y"], c=c, s=145, marker=m, zorder=5,
+                   edgecolors="none", alpha=0.50)
+
+    # 5. Jugadores solo en zona de última línea (excluye los que también están en zona inmediata)
+    for p in _up:
+        _in_imm = dist_m(p["x"], p["y"], _bx, _by) <= RADIUS_METERS
+        _in_ll  = _ldx <= p["x"] <= _zxmax and not p["keeper"]
+        if not _in_ll or _in_imm:
+            continue
+        c = "#1976d2" if p["is_losing"] else "#d32f2f"
+        ax.scatter(p["x"], p["y"], c=c, s=245, marker="o", zorder=6,
+                   edgecolors="white", linewidths=1.3, alpha=0.82)
+
+    # 6. Jugadores en zona inmediata (opacos, tamaño mayor)
+    _uimm     = [p for p in _up if dist_m(p["x"], p["y"], _bx, _by) <= RADIUS_METERS]
+    _udef_imm = [p for p in _uimm if p["is_losing"]]
+    for p in _uimm:
+        c = "#1976d2" if p["is_losing"] else "#d32f2f"
+        m = "s" if p["keeper"] else "o"
+        ax.scatter(p["x"], p["y"], c=c, s=305, marker=m, zorder=7,
+                   edgecolors="white", linewidths=1.5)
+
+    # 7. Defensores goal-side (anillo verde)
+    _udball  = dist_m(_bx, _by, OWN_GOAL_X, OWN_GOAL_Y)
+    _ugs_ids = {id(p) for p in _udef_imm
+                if dist_m(p["x"], p["y"], OWN_GOAL_X, OWN_GOAL_Y) < _udball}
+    for p in _udef_imm:
+        if id(p) in _ugs_ids:
+            ax.scatter(p["x"], p["y"], s=510, facecolors="none",
+                       edgecolors="#69f0ae", linewidths=2.5, zorder=8)
+
+    # 8. Defensor más cercano al balón (estrella dorada + línea)
+    _unear = (min(_udef_imm, key=lambda p: dist_m(p["x"], p["y"], _bx, _by))
+              if _udef_imm else None)
+    if _unear:
+        _ud_near = dist_m(_unear["x"], _unear["y"], _bx, _by)
+        ax.plot([_bx, _unear["x"]], [_by, _unear["y"]],
+                color="gold", linestyle="--", linewidth=1.5, alpha=0.85, zorder=7)
+        ax.scatter(_unear["x"], _unear["y"], s=590, marker="*",
+                   c="gold", edgecolors="black", linewidths=1, zorder=10)
+        ax.annotate(f"{_ud_near:.1f} m", xy=(_unear["x"], _unear["y"]),
+                    xytext=(6, 8), textcoords="offset points",
+                    color="gold", fontsize=10, fontweight="bold")
+
+    # 9. Último defensor de campo (estrella cian + línea a portería)
+    ax.scatter(_last_def["x"], _last_def["y"], s=630, marker="*",
+               c="#00bcd4", edgecolors="black", linewidths=1, zorder=10)
+    _udg = dist_m(_last_def["x"], _last_def["y"], OWN_GOAL_X, OWN_GOAL_Y)
+    ax.plot([OWN_GOAL_X, _last_def["x"]], [OWN_GOAL_Y, _last_def["y"]],
+            color="#00bcd4", linestyle=":", linewidth=1.5, alpha=0.7, zorder=5)
+    ax.annotate(f"{_udg:.1f} m",
+                xy=((_last_def["x"] + OWN_GOAL_X) / 2, (_last_def["y"] + OWN_GOAL_Y) / 2),
+                color="#00bcd4", fontsize=10, fontweight="bold", ha="center", va="bottom")
+
+    # 10. Nuevo poseedor: jugador del equipo que recupera (is_losing=False) más cercano al balón
+    _u_transition_of = [p for p in _up if not p["is_losing"] and not p["keeper"]]
+    _upossessor      = (min(_u_transition_of, key=lambda p: dist_m(p["x"], p["y"], _bx, _by))
+                       if _u_transition_of else None)
+    if _upossessor:
+        ax.scatter(_upossessor["x"], _upossessor["y"], c="#ff9800", s=440, marker="o",
+                   zorder=10, edgecolors="black", linewidths=2)
+
+    # 11. Balón — más pequeño que el círculo naranja del poseedor para que se vea el naranja
+    ax.scatter(_bx, _by, s=180, c="white", edgecolors="black", linewidths=2, zorder=11)
+    ax.annotate("Balón", xy=(_bx, _by), xytext=(5, -16),
+                textcoords="offset points", color="#1a1a1a", fontsize=9.5, fontweight="bold")
+    ax.scatter(OWN_GOAL_X, OWN_GOAL_Y, s=260, c="#888888",
+               marker="*", zorder=7, edgecolors="#444444")
+
+    # ── Leyenda ─────────────────────────────────────────────────────────────
+    _dr_u = _llrow["last_line_def_area_ratio"]
+    _am_u = _llrow["last_line_avg_marking_dist_m"]
+    _dr_s_u = f"{_dr_u:.1%}" if np.isfinite(_dr_u) else "N/A"
+    _am_s_u = f"{_am_u:.1f} m" if np.isfinite(_am_u) else "N/A"
+
+    legend_u = [
+        mpatches.Patch(color="#1565c0",
+                       label=f"En zona inmediata ({_zrow['losing_team']})"),
+        mpatches.Patch(color="#c62828",
+                       label=f"En zona inmediata ({_zrow['transition_team']})"),
+        mpatches.Patch(color="#1565c0", alpha=0.75,
+                       label=f"En zona últ. línea ({_zrow['losing_team']})"),
+        mpatches.Patch(color="#c62828", alpha=0.75,
+                       label=f"En zona últ. línea ({_zrow['transition_team']})"),
+        mpatches.Patch(color="#90caf9", alpha=0.6, label="Fuera de zonas (def.)"),
+        mpatches.Patch(color="#ef9a9a", alpha=0.6, label="Fuera de zonas (atac.)"),
+        plt.Line2D([0], [0], marker="o", color="k", markerfacecolor="none",
+                   markeredgecolor="#2e7d32", markeredgewidth=2.5, markersize=11,
+                   label="Defensor goal-side"),
+        plt.Line2D([0], [0], marker="*", color="k", markerfacecolor="gold",
+                   markersize=13, label="Def. más cercano al balón"),
+        plt.Line2D([0], [0], marker="*", color="k", markerfacecolor="#00bcd4",
+                   markersize=13, label="Último defensor de campo"),
+        mpatches.Patch(color="#ff9800", label="Nuevo poseedor (recuperación)"),
+        mpatches.Patch(facecolor="gold", alpha=0.20, edgecolor="gold",
+                       linestyle="--", label=f"Zona inmediata ({RADIUS_METERS} m)"),
+        mpatches.Patch(facecolor="#00bcd4", alpha=0.20, edgecolor="#00bcd4",
+                       label=f"Zona última línea ({LAST_LINE_DEPTH_METERS} m)"),
+        mpatches.Patch(facecolor="#c5e8c5", alpha=0.90, edgecolor="#388e3c",
+                       label="Área visible de cámara"),
+    ]
+    ax.legend(handles=legend_u, loc="upper right", framealpha=0.95,
+              fontsize=8.5, facecolor="white", labelcolor="#1a1a1a",
+              edgecolor="#cccccc", ncol=2)
+
+    ax.set_title(
+        f"Visualización unificada  ·  "
+        f"{_zrow['losing_team']} vs {_zrow['transition_team']}  "
+        f"|  Acción: {_zrow['turnover_action_type']}  (min {_zrow['action_minute']:.0f}')\n"
+        f"Zona inmediata — Def.: {int(_zrow['zone_losing_players'])}  "
+        f"Atac.: {int(_zrow['zone_transition_players'])}  "
+        f"Goal-side: {int(_zrow['defenders_goalside_in_zone'])}    ·    "
+        f"Última línea — Def.: {int(_llrow['last_line_losing_players'])}  "
+        f"Atac.: {int(_llrow['last_line_transition_players'])}  "
+        f"Voronoi def.: {_dr_s_u}  |  Marcaje med.: {_am_s_u}",
+        color="#1a1a1a", fontsize=10.5, pad=12,
+    )
+    plt.tight_layout()
+    plt.show()
+```
+
+## 9. Dataframes finales — carga por lotes con I/O en paralelo
+
+`model_dataset` se construye procesando todos los partidos de `match_ids_to_process`. Los eventos y datos 360 se descargan en paralelo con `ThreadPoolExecutor`; el cálculo de variables (zona, última línea) se aplica en serie para evitar contención con numpy.
+
+Los tres datasets de modelado solo incluyen filas **con datos 360** (`zone_losing_players` no nulo), que es donde las variables espaciales son fiables.
+
+### Helpers I/O y procesamiento por partido
+
+```{python}
+from concurrent.futures import ThreadPoolExecutor
+import requests as _requests
+
+_MAX_WORKERS = 8   # descargas en paralelo
+
+
+def _load_match_io(mid):
+    # Descarga eventos + datos 360 de un partido (I/O en paralelo).
+    try:
+        _raw_ev = sb.events(match_id=mid)
+    except Exception as _e:
+        return mid, None, {}, {}, str(_e)
+
+    _fz, _va_lk = load_360_lookups(mid, verbose=False)
+
+    return mid, _raw_ev, _fz, _va_lk, None
+
+
+def _process_match_to_context(mid, raw_ev, fz, va_lk, mrow):
+    # Procesa un partido completo y devuelve un DataFrame de pérdidas con contexto.
+    # Replica la lógica de las secciones 5-8 de forma autocontenida para permitir
+    # el procesamiento en lotes sin depender de variables globales de partido.
+
+    # Eventos locales (prepare_events usa MATCH_ID global -> sobreescribimos match_id)
+    _ev = prepare_events(raw_ev)
+    _ev["match_id"] = int(mid)
+
+    _local_home = mrow["home_team"]
+    _local_away = mrow["away_team"]
+
+    # Goles y tarjetas rojas locales
+    _goals = (
+        _ev[(_ev["type"] == "Shot") & (_ev["shot_outcome"] == "Goal")]
+        [["period", "event_order", "event_seconds", "team"]]
+        .sort_values(["period", "event_order"])
+        .reset_index(drop=True)
+    )
+    _red_vals = {"Red Card", "Second Yellow", "Second Yellow Card"}
+    _red_cards_loc = _ev[
+        _ev[["foul_committed_card", "bad_behaviour_card"]]
+        .apply(lambda row: any(str(v) in _red_vals for v in row.dropna()), axis=1)
+    ][["period", "event_order", "event_seconds", "team"]].copy()
+
+    def _opp(team):
+        if team == _local_home: return _local_away
+        if team == _local_away: return _local_home
+        return pd.NA
+
+    def _score(period, event_order, team):
+        rival = _opp(team)
+        prev = _goals[
+            (_goals["period"] < period)
+            | ((_goals["period"] == period) & (_goals["event_order"] < event_order))
+        ]
+        tg = int((prev["team"] == team).sum())
+        rg = int((prev["team"] == rival).sum())
+        diff = tg - rg
+        if diff > 0: return "winning", diff
+        if diff < 0: return "losing", diff
+        return "drawing", diff
+
+    def _num_eq(period, event_order, team):
+        rival = _opp(team)
+        prev = _red_cards_loc[
+            (_red_cards_loc["period"] < period)
+            | ((_red_cards_loc["period"] == period) & (_red_cards_loc["event_order"] < event_order))
+        ]
+        tp = 11 - int((prev["team"] == team).sum())
+        rp = 11 - int((prev["team"] == rival).sum())
+        return tp == rp, tp, rp
+
+    # Variables de zona (usa fz local en lugar del global freeze_lookup)
+    def _zone_vars_local(row):
+        frame = fz.get(_event_key(row.get("turnover_event_id")))
+        if not frame:
+            return _NAN_ZONE.copy()
+        bx, by = row["loss_x"], row["loss_y"]
+        source = row["turnover_event_source"]
+        nm = source in {"defensive_event", "next_possession_recovery"}
+        players = []
+        for p in frame:
+            loc = p.get("location", [np.nan, np.nan])
+            px, py = float(loc[0]), float(loc[1])
+            if nm:
+                px, py = mirror_x(px), mirror_y(py)
+            tm = bool(p.get("teammate", False))
+            ac = bool(p.get("actor", False))
+            il = not (tm or ac) if nm else (tm or ac)
+            players.append({
+                "x": px, "y": py, "is_losing": il,
+                "dist_to_ball": dist_m(px, py, bx, by),
+            })
+        iz = [p for p in players if p["dist_to_ball"] <= RADIUS_METERS]
+        zl = sum(1 for p in iz if p["is_losing"])
+        zt = sum(1 for p in iz if not p["is_losing"])
+        liz = [p for p in iz if p["is_losing"]]
+        nd = min((p["dist_to_ball"] for p in liz), default=np.nan)
+        dbg = dist_m(bx, by, OWN_GOAL_X, OWN_GOAL_Y)
+        gc = sum(
+            1 for p in liz
+            if dist_m(p["x"], p["y"], OWN_GOAL_X, OWN_GOAL_Y) < dbg
+        )
+        return {
+            "zone_losing_players":        zl,
+            "zone_transition_players":    zt,
+            "zone_player_diff":           zl - zt,
+            "nearest_defender_dist_m":    nd,
+            "defenders_goalside_in_zone": gc,
+        }
+
+    # Variables de última línea (usa fz local)
+    def _ll_vars_local(row):
+        frame = fz.get(_event_key(row.get("turnover_event_id")))
+        if not frame:
+            return _NAN_LL.copy()
+        source = row["turnover_event_source"]
+        nm = source in {"defensive_event", "next_possession_recovery"}
+        players = []
+        for p in frame:
+            loc = p.get("location", [np.nan, np.nan])
+            px, py = float(loc[0]), float(loc[1])
+            if nm:
+                px, py = mirror_x(px), mirror_y(py)
+            if not (np.isfinite(px) and np.isfinite(py)):
+                continue
+            tm = bool(p.get("teammate", False))
+            ac = bool(p.get("actor", False))
+            kp = bool(p.get("keeper", False))
+            il = not (tm or ac) if nm else (tm or ac)
+            players.append({"x": px, "y": py, "is_losing": il, "keeper": kp})
+        od = [p for p in players if p["is_losing"] and not p["keeper"]]
+        if not od:
+            return _NAN_LL.copy()
+        ld = min(od, key=lambda p: p["x"])
+        ldx = ld["x"]
+        ldd = dist_m(ld["x"], ld["y"], OWN_GOAL_X, OWN_GOAL_Y)
+        zxmax = min(ldx + LAST_LINE_DEPTH_SB, SB_LENGTH)
+        zp = _Polygon([(ldx, 0), (zxmax, 0), (zxmax, SB_WIDTH), (ldx, SB_WIDTH)])
+        izl = [
+            p for p in players
+            if p["is_losing"] and not p["keeper"] and ldx <= p["x"] <= zxmax
+        ]
+        izt = [p for p in players if not p["is_losing"] and ldx <= p["x"] <= zxmax]
+        pvf = [p for p in players if not p["keeper"]]
+        dar = _voronoi_area_ratio(pvf, zp)
+        if izt:
+            da = [p for p in players if p["is_losing"] and not p["keeper"]]
+            avg_m = float(np.mean([
+                min(dist_m(a["x"], a["y"], d["x"], d["y"]) for d in da)
+                for a in izt
+            ])) if da else np.nan
+        else:
+            avg_m = np.nan
+        return {
+            "last_def_dist_to_goal_m":      ldd,
+            "last_line_losing_players":     len(izl),
+            "last_line_transition_players": len(izt),
+            "last_line_player_diff":        len(izl) - len(izt),
+            "last_line_def_area_ratio":     dar,
+            "last_line_avg_marking_dist_m": avg_m,
+        }
+
+    def _corridor_vars_local(row):
+        frame = fz.get(_event_key(row.get("turnover_event_id")))
+        bx, by = row["loss_x"], row["loss_y"]
+        poly = corridor_polygon(bx)
+        if poly is None:
+            return _NAN_CORRIDOR.copy()
+        if not frame:
+            out = _NAN_CORRIDOR.copy()
+            out["loss_dist_to_own_goal_m"] = dist_m(bx, by, OWN_GOAL_X, OWN_GOAL_Y)
+            out["loss_angle_to_own_goal_rad"] = goal_angle_to_own_goal(bx, by)
+            return out
+
+        source = row["turnover_event_source"]
+        nm = source in {"defensive_event", "next_possession_recovery"}
+        players = []
+        for p in frame:
+            loc = p.get("location", [np.nan, np.nan])
+            px, py = float(loc[0]), float(loc[1])
+            if nm:
+                px, py = mirror_x(px), mirror_y(py)
+            if not (np.isfinite(px) and np.isfinite(py)):
+                continue
+            tm = bool(p.get("teammate", False))
+            ac = bool(p.get("actor", False))
+            kp = bool(p.get("keeper", False))
+            il = not (tm or ac) if nm else (tm or ac)
+            players.append({"x": px, "y": py, "is_losing": il, "keeper": kp})
+
+        inc = [p for p in players if 0.0 <= p["x"] <= bx]
+        defenders = [p for p in inc if p["is_losing"] and not p["keeper"]]
+        attackers = [p for p in inc if not p["is_losing"]]
+        pvf = [p for p in players if not p["keeper"]]
+        dar = _voronoi_area_ratio(pvf, poly)
+        nearest_def = min((dist_m(p["x"], p["y"], bx, by) for p in defenders), default=np.nan)
+        if attackers and defenders:
+            avg_m = float(np.mean([
+                min(dist_m(a["x"], a["y"], d["x"], d["y"]) for d in defenders)
+                for a in attackers
+            ]))
+        else:
+            avg_m = np.nan
+
+        return {
+            "loss_dist_to_own_goal_m":          dist_m(bx, by, OWN_GOAL_X, OWN_GOAL_Y),
+            "loss_angle_to_own_goal_rad":       goal_angle_to_own_goal(bx, by),
+            "corridor_losing_players":          len(defenders),
+            "corridor_transition_players":      len(attackers),
+            "corridor_player_diff":             len(defenders) - len(attackers),
+            "corridor_def_area_ratio":          dar,
+            "corridor_avg_marking_dist_m":      avg_m,
+            "corridor_nearest_defender_dist_m": nearest_def,
+        }
+
+    # Meta de posesiónes y construcción de filas
+    _meta = possession_meta(_ev)
+    _rows = []
+    for i in range(len(_meta) - 1):
+        cp = _meta.iloc[i]
+        np_ = _meta.iloc[i + 1]
+        if cp["period"] != np_["period"]:
+            continue
+        lt = cp["possession_team"]
+        tt = np_["possession_team"]
+        if lt == tt:
+            continue
+        tev, prev_ev = choose_turnover_event(_ev, cp, np_)
+        if tev is None:
+            continue
+        if is_restart_or_out(prev_ev, np_):
+            continue
+        if tev["turnover_event_source"] in {"defensive_event", "next_possession_recovery"}:
+            lx = mirror_x(tev["turnover_x"])
+            ly = mirror_y(tev["turnover_y"])
+            tx = tev["turnover_x"]
+            ty = tev["turnover_y"]
+        else:
+            lx = tev["turnover_x"]
+            ly = tev["turnover_y"]
+            tx = mirror_x(tev["turnover_x"])
+            ty = mirror_y(tev["turnover_y"])
+        si = first_shot_after_turnover(_ev, tt, np_, float(np_["start_seconds"]))
+        _rows.append({
+            "match_id":                     int(mid),
+            "sample_group":                 mrow.get("sample_group", pd.NA),
+            "source_competition_id":        int(mrow.get("source_competition_id", -1)),
+            "source_season_id":             int(mrow.get("source_season_id", -1)),
+            "competition":                  mrow.get("competition", pd.NA),
+            "season":                       mrow.get("season", pd.NA),
+            "period":                       int(cp["period"]),
+            "losing_team":                  lt,
+            "transition_team":              tt,
+            "lost_possession":              cp["possession"],
+            "transition_possession":        np_["possession"],
+            "lost_possession_play_pattern": cp["play_pattern"],
+            "transition_play_pattern":      np_["play_pattern"],
+            "action_minute":                round(float(np_["start_seconds"]) / 60, 2),
+            "event_seconds":                float(np_["start_seconds"]),
+            "loss_x":                       lx,
+            "loss_y":                       ly,
+            "loss_zone_bin":                pitch_bin(lx, ly),
+            "transition_x":                 tx,
+            "transition_y":                 ty,
+            **tev,
+            **si,
+        })
+
+    if not _rows:
+        return pd.DataFrame()
+
+    _df = pd.DataFrame(_rows)
+
+    # LOSING_TEAM_FILTER por partido
+    if LOSING_TEAM_FILTER is not None:
+        _ltf = (
+            {LOSING_TEAM_FILTER} if isinstance(LOSING_TEAM_FILTER, str)
+            else set(LOSING_TEAM_FILTER)
+        )
+        _df = _df[_df["losing_team"].isin(_ltf)].reset_index(drop=True)
+
+    if _df.empty:
+        return pd.DataFrame()
+
+    # Contexto (marcador + igualdad numérica)
+    _ctx = []
+    for _, loss in _df.iterrows():
+        ss, sd = _score(int(loss["period"]), float(loss["turnover_event_order"]), loss["losing_team"])
+        ie, lp, tp = _num_eq(int(loss["period"]), float(loss["turnover_event_order"]), loss["losing_team"])
+        _ctx.append({
+            "losing_team_score_state":     ss,
+            "losing_team_score_diff":      sd,
+            "losing_team_players":         lp,
+            "transition_team_players":     tp,
+            "transition_team_player_diff": tp - lp,
+            "is_numérical_equality":       ie,
+        })
+    _df = pd.concat([_df.reset_index(drop=True), pd.DataFrame(_ctx)], axis=1)
+
+    # Variables de zona
+    _zdf = _df.apply(_zone_vars_local, axis=1, result_type="expand")
+    _df = pd.concat([_df.reset_index(drop=True), _zdf.reset_index(drop=True)], axis=1)
+
+    # Variables de última línea
+    _lldf = _df.apply(_ll_vars_local, axis=1, result_type="expand")
+    _df = pd.concat([_df.reset_index(drop=True), _lldf.reset_index(drop=True)], axis=1)
+
+    # Variables de corredor de transición
+    _cdf = _df.apply(_corridor_vars_local, axis=1, result_type="expand")
+    _df = pd.concat([_df.reset_index(drop=True), _cdf.reset_index(drop=True)], axis=1)
+
+    return _df
+```
+
+### Bucle por lotes y construcción de datasets
+
+```{python}
+from pathlib import Path
+import hashlib
+import json
+
+_cache_dir = Path(CACHE_DIR)
+_cache_dir.mkdir(parents=True, exist_ok=True)
+
+_cache_params = {
+    "dataset_groups": DATASET_GROUPS,
+    "competition_seasons": COMPETITION_SEASONS,
+    "match_id": _requested_match_id,
+    "team_filter": TEAM_FILTER,
+    "losing_team_filter": LOSING_TEAM_FILTER,
+    "shot_window_seconds": SHOT_WINDOW_SECONDS,
+    "pitch_bins_x": PITCH_BINS_X,
+    "pitch_bins_y": PITCH_BINS_Y,
+    "match_ids": match_ids_to_process,
+}
+_cache_key = hashlib.md5(
+    json.dumps(_cache_params, sort_keys=True, default=str).encode("utf-8")
+).hexdigest()[:12]
+
+_model_cache_path = _cache_dir / f"model_dataset_{_cache_key}.pkl"
+_metadata_cache_path = _cache_dir / f"metadata_{_cache_key}.json"
+
+_CACHE_TARGET_COL = "transition_shot_within_window"
+_REQUIRED_MODEL_CACHE_COLS = {"match_id", _CACHE_TARGET_COL, "zone_losing_players"}
+
+
+def _valid_model_cache(df):
+    return (
+        isinstance(df, pd.DataFrame)
+        and len(df) > 0
+        and _REQUIRED_MODEL_CACHE_COLS.issubset(df.columns)
+    )
+
+
+_loaded_valid_cache = False
+if USE_DATA_CACHE and _model_cache_path.exists() and not REBUILD_DATA_CACHE:
+    _cached_model_dataset = pd.read_pickle(_model_cache_path)
+    if _valid_model_cache(_cached_model_dataset):
+        model_dataset = _cached_model_dataset
+        _loaded_valid_cache = True
+        print(f"✓ model_dataset cargado desde caché: {_model_cache_path}")
+        print(f"  filas: {len(model_dataset):,}")
+    else:
+        print(
+            f"⚠ Caché inválida o vacía ignorada: {_model_cache_path}. "
+            "Se reconstruirá el dataset."
+        )
+
+if not _loaded_valid_cache:
+    _io_results = {}
+    print(f"Descargando {len(match_ids_to_process)} partidos ({_MAX_WORKERS} workers)...")
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as _pool:
+        for _mid, _raw, _fz, _va, _err in _pool.map(_load_match_io, match_ids_to_process):
+            _io_results[_mid] = (_raw, _fz, _va, _err)
+
+    _all_dfs = []
+    for _i, _mid in enumerate(match_ids_to_process, 1):
+        _raw, _fz, _va, _err = _io_results[_mid]
+        if _err or _raw is None:
+            print(f"  [{_i}/{len(match_ids_to_process)}] {_mid} — error I/O: {_err}")
+            continue
+        _mrow = matches_filtered[matches_filtered["match_id"] == _mid].iloc[0]
+        try:
+            _part = _process_match_to_context(_mid, _raw, _fz, _va, _mrow)
+            print(f"  [{_i}/{len(match_ids_to_process)}] {_mid} — {len(_part):,} pérdidas")
+            if _part is not None and not _part.empty:
+                _all_dfs.append(_part)
+        except Exception as _e:
+            print(f"  [{_i}/{len(match_ids_to_process)}] {_mid} — error proceso: {_e}")
+
+    if not _all_dfs:
+        raise RuntimeError(
+            "No se ha podido construir `model_dataset`: todos los partidos han fallado "
+            "o no han generado pérdidas válidas. Revisa los mensajes `error I/O` y "
+            "`error proceso` impresos arriba."
+        )
+
+    model_dataset = pd.concat(_all_dfs, ignore_index=True)
+    print(f"\nmodel_dataset total: {len(model_dataset):,} filas")
+
+    if USE_DATA_CACHE and _valid_model_cache(model_dataset):
+        model_dataset.to_pickle(_model_cache_path)
+        _metadata_cache_path.write_text(
+            json.dumps({
+                **_cache_params,
+                "cache_key": _cache_key,
+                "rows": int(len(model_dataset)),
+                "columns": list(model_dataset.columns),
+            }, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        print(f"✓ model_dataset guardado en caché: {_model_cache_path}")
+    elif USE_DATA_CACHE:
+        print("⚠ model_dataset no guardado en caché porque no supera la validación mínima.")
+```
+
+```{python}
+TARGET_COL = "transition_shot_within_window"
+
+random_forest_cols = [
+    TARGET_COL,
+    "action_minute", "losing_team_score_state", "losing_team_score_diff",
+    "transition_team_player_diff", "losing_team_players", "transition_team_players",
+    "loss_x", "loss_y", "loss_zone_bin",
+    "turnover_action_type", "turnover_event_source",
+    "lost_possession_play_pattern", "transition_play_pattern",
+    "under_pressure", "counterpress",
+    "sample_group", "competition", "season", "losing_team", "transition_team",
+    "zone_losing_players", "zone_transition_players", "zone_player_diff",
+    "nearest_defender_dist_m", "defenders_goalside_in_zone",
+    "last_def_dist_to_goal_m",
+    "last_line_losing_players", "last_line_transition_players", "last_line_player_diff",
+    "last_line_def_area_ratio", "last_line_avg_marking_dist_m",
+    "loss_dist_to_own_goal_m", "loss_angle_to_own_goal_rad",
+    "corridor_losing_players", "corridor_transition_players", "corridor_player_diff",
+    "corridor_def_area_ratio", "corridor_avg_marking_dist_m",
+    "corridor_nearest_defender_dist_m",
+]
+
+logistic_regression_cols = [
+    TARGET_COL,
+    "action_minute", "losing_team_score_diff", "transition_team_player_diff",
+    "loss_x", "loss_y", "loss_zone_bin",
+    "zone_player_diff", "nearest_defender_dist_m", "defenders_goalside_in_zone",
+    "last_def_dist_to_goal_m", "last_line_player_diff",
+    "last_line_def_area_ratio", "last_line_avg_marking_dist_m",
+    "loss_dist_to_own_goal_m", "loss_angle_to_own_goal_rad",
+    "corridor_player_diff", "corridor_def_area_ratio",
+    "corridor_avg_marking_dist_m", "corridor_nearest_defender_dist_m",
+]
+
+review_cols = [
+    TARGET_COL,
+    "sample_group", "competition", "season", "match_id", "period", "lost_possession", "transition_possession",
+    "losing_team", "transition_team",
+    "action_minute", "loss_x", "loss_y",
+    "turnover_action_type", "turnover_event_source",
+    "seconds_to_shot", "shot_outcome", "shot_statsbomb_xg",
+]
+
+_missing_required_cols = [c for c in ["match_id", TARGET_COL, "zone_losing_players"] if c not in model_dataset.columns]
+if _missing_required_cols:
+    raise RuntimeError(
+        "model_dataset no contiene las columnas mínimas esperadas "
+        f"{_missing_required_cols}. Esto suele indicar una caché antigua/vacía o "
+        "fallos en todos los partidos durante el procesamiento por lotes. "
+        "Pon REBUILD_DATA_CACHE = True para forzar reconstrucción y revisa los "
+        "mensajes de error del bloque anterior."
+    )
+
+_mask_360_ok = model_dataset["zone_losing_players"].notna()
+if _mask_360_ok.any():
+    model_dataset_modeling = model_dataset.loc[_mask_360_ok].reset_index(drop=True)
+    _modeling_scope = "con datos 360"
+else:
+    model_dataset_modeling = model_dataset.reset_index(drop=True)
+    _modeling_scope = "sin datos 360: fallback con todas las pérdidas"
+    print(
+        "⚠ No hay pérdidas con fotograma 360 asociado. "
+        "Los modelos se entrenarán como baseline con las variables disponibles."
+    )
+
+random_forest_dataset = model_dataset_modeling[
+    [c for c in random_forest_cols if c in model_dataset_modeling.columns]
+].dropna(axis=1, how="all").copy()
+
+logistic_regression_dataset = model_dataset_modeling[
+    [c for c in logistic_regression_cols if c in model_dataset_modeling.columns]
+].dropna(axis=1, how="all").copy()
+
+dangerous_losses_window = (
+    model_dataset[model_dataset[TARGET_COL] == 1]
+    [[c for c in review_cols if c in model_dataset.columns]]
+    .copy()
+    .reset_index(drop=True)
+)
+
+if USE_DATA_CACHE:
+    _dataset_cache_paths = {
+        "model_dataset_modeling": _cache_dir / f"model_dataset_modeling_{_cache_key}.pkl",
+        "random_forest_dataset": _cache_dir / f"random_forest_dataset_{_cache_key}.pkl",
+        "logistic_regression_dataset": _cache_dir / f"logistic_regression_dataset_{_cache_key}.pkl",
+        "dangerous_losses_window": _cache_dir / f"dangerous_losses_window_{_cache_key}.pkl",
+    }
+    model_dataset_modeling.to_pickle(_dataset_cache_paths["model_dataset_modeling"])
+    random_forest_dataset.to_pickle(_dataset_cache_paths["random_forest_dataset"])
+    logistic_regression_dataset.to_pickle(_dataset_cache_paths["logistic_regression_dataset"])
+    dangerous_losses_window.to_pickle(_dataset_cache_paths["dangerous_losses_window"])
+    print("✓ Datasets de modelado guardados en caché:")
+    for _name, _path in _dataset_cache_paths.items():
+        print(f"  - {_name}: {_path}")
+
+print(f"model_dataset              : {len(model_dataset):,} pérdidas en juego")
+print(f"model_dataset_modeling     : {len(model_dataset_modeling):,}  ({_modeling_scope})")
+print(f"random_forest_dataset      : {len(random_forest_dataset):,} filas, "
+      f"{random_forest_dataset.shape[1]} cols")
+print(f"logistic_regression_dataset: {len(logistic_regression_dataset):,} filas, "
+      f"{logistic_regression_dataset.shape[1]} cols")
+print(f"dangerous_losses_window    : {len(dangerous_losses_window):,} positivos")
+dangerous_losses_window.head(10)
+```
+
+## 10. Diagnóstico del dataset
+
+Conjunto de chequeos para validar la calidad del dataset antes de entrenar los modelos.
+
+### 10.1 Cabecera y dimensiones
+
+```{python}
+print(f"Ventana temporal del target  : <= {SHOT_WINDOW_SECONDS} s")
+print(f"Equipos pierden balón (filt.): {LOSING_TEAM_FILTER}")
+print(f"Partidos cargados            : {model_dataset['match_id'].nunique()}")
+print(f"pérdidas totales             : {len(model_dataset):,}")
+print(f"  con datos 360              : {model_dataset['zone_losing_players'].notna().sum():,}")
+print(f"  para modelado              : {len(model_dataset_modeling):,}")
+print(f"Positivos (tiro en ventana)  : {int(model_dataset[TARGET_COL].sum()):,}  "
+      f"({100 * model_dataset[TARGET_COL].mean():.2f} %)")
+print(f"Bins de zona ({PITCH_BINS_X}x{PITCH_BINS_Y}): "
+      f"{PITCH_BINS_X * PITCH_BINS_Y} zonas")
+if {"sample_group", "competition", "season"}.issubset(model_dataset_modeling.columns):
+    display(
+        model_dataset_modeling
+        .groupby(["sample_group", "competition", "season"], observed=True)
+        .agg(
+            partidos=("match_id", "nunique"),
+            perdidas=("match_id", "count"),
+            positivos=(TARGET_COL, "sum"),
+            tasa_tiro=(TARGET_COL, "mean"),
+        )
+        .reset_index()
+        .sort_values(["sample_group", "competition", "season"])
+    )
+model_dataset_modeling.head(5)
+```
+
+### 10.2 Tipos de pérdida y tasa de tiro
+
+```{python}
+print("Tipos de pérdida detectados (model_dataset_modeling)")
+display(
+    model_dataset_modeling
+    .groupby(["turnover_action_type", "turnover_event_source"], dropna=False)
+    .agg(
+        pérdidas=(TARGET_COL, "count"),
+        tiros=(TARGET_COL, "sum"),
+    )
+    .assign(pct_tiro=lambda d: (100 * d["tiros"] / d["pérdidas"]).round(1))
+    .reset_index()
+    .sort_values("pérdidas", ascending=False)
+)
+
+print("\nResumen por estado de marcador e igualdad numérica")
+display(
+    model_dataset_modeling
+    .groupby(["losing_team_score_state", "transition_team_player_diff"], dropna=False)
+    .agg(
+        pérdidas=(TARGET_COL, "count"),
+        tiros=(TARGET_COL, "sum"),
+    )
+    .assign(pct_tiro=lambda d: (100 * d["tiros"] / d["pérdidas"]).round(1))
+    .reset_index()
+    .sort_values(["losing_team_score_state", "transition_team_player_diff"])
+)
+```
+
+### 10.3 Distribución de variables numéricas
+
+```{python}
+import matplotlib.pyplot as plt
+
+_num_diag_cols = [
+    "action_minute", "loss_x", "loss_y", "losing_team_score_diff",
+    "zone_player_diff", "nearest_defender_dist_m", "defenders_goalside_in_zone",
+    "last_def_dist_to_goal_m", "last_line_player_diff",
+    "last_line_def_area_ratio", "last_line_avg_marking_dist_m",
+    "loss_dist_to_own_goal_m", "loss_angle_to_own_goal_rad",
+    "corridor_player_diff", "corridor_def_area_ratio",
+    "corridor_avg_marking_dist_m", "corridor_nearest_defender_dist_m",
+]
+_num_diag_cols = [c for c in _num_diag_cols if c in model_dataset_modeling.columns]
+
+_pos = model_dataset_modeling[model_dataset_modeling[TARGET_COL] == 1]
+_neg = model_dataset_modeling[model_dataset_modeling[TARGET_COL] == 0]
+
+_ncols = 4
+_nrows = (len(_num_diag_cols) + _ncols - 1) // _ncols
+fig, axes = plt.subplots(_nrows, _ncols, figsize=(11, 3.0 * _nrows))
+axes = axes.flatten()
+
+for k, col in enumerate(_num_diag_cols):
+    ax = axes[k]
+    ax.hist(_neg[col].dropna(), bins=30, alpha=0.55, color="#90caf9",
+            label="No tiro", density=True)
+    ax.hist(_pos[col].dropna(), bins=30, alpha=0.55, color="#ef9a9a",
+            label="Tiro", density=True)
+    ax.set_title(col, fontsize=9)
+    ax.legend(fontsize=7)
+    ax.grid(alpha=0.3)
+
+for k in range(len(_num_diag_cols), len(axes)):
+    axes[k].set_visible(False)
+
+plt.suptitle("Distribución de variables numéricas: tiro vs no tiro", fontsize=12, y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+### 10.4 Cobertura de datos 360 por zona
+
+```{python}
+_cov = (
+    model_dataset
+    .assign(_has360=lambda d: d["zone_losing_players"].notna().astype(int))
+    .groupby("loss_zone_bin", dropna=False)
+    .agg(total=("match_id", "count"), con360=("_has360", "sum"))
+    .assign(cobertura=lambda d: (100 * d["con360"] / d["total"]).round(1))
+    .reset_index()
+    .sort_values("loss_zone_bin")
+)
+print("Cobertura de datos 360 por zona de pérdida:")
+display(_cov)
+print(f"\nCobertura global: {100 * model_dataset['zone_losing_players'].notna().mean():.1f} %")
+```
+
+### 10.5 Desequilibrio de clases
+
+```{python}
+_vc = model_dataset_modeling[TARGET_COL].value_counts()
+print("Distribución de la variable objetivo (model_dataset_modeling):")
+display(_vc.rename({0: "Sin tiro (0)", 1: "Con tiro (1)"}))
+
+fig, ax = plt.subplots(figsize=(5, 3.5))
+ax.bar(["Sin tiro (0)", "Con tiro (1)"], [_vc.get(0, 0), _vc.get(1, 0)],
+       color=["#90caf9", "#ef9a9a"], edgecolor="white")
+ax.set_ylabel("pérdidas")
+ax.set_title("Desequilibrio de clases")
+for i, v in enumerate([_vc.get(0, 0), _vc.get(1, 0)]):
+    ax.text(i, v + 0.5, str(v), ha="center", fontsize=10, fontweight="bold")
+ax.grid(axis="y", alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+### 10.6 Variables categóricas
+
+```{python}
+_cat_diag = ["turnover_action_type", "turnover_event_source", "loss_zone_bin"]
+_cat_diag = [c for c in _cat_diag if c in model_dataset_modeling.columns]
+
+fig, axes = plt.subplots(1, len(_cat_diag), figsize=(min(11, 4 * len(_cat_diag)), 4.5))
+if len(_cat_diag) == 1:
+    axes = [axes]
+
+for ax, col in zip(axes, _cat_diag):
+    _tbl = (
+        model_dataset_modeling
+        .groupby(col, dropna=False)[TARGET_COL]
+        .agg(["count", "sum"])
+        .rename(columns={"count": "total", "sum": "tiros"})
+        .assign(pct=lambda d: 100 * d["tiros"] / d["total"])
+        .reset_index()
+        .sort_values("total", ascending=False)
+        .head(15)
+    )
+    ax.barh(_tbl[col].astype(str), _tbl["pct"], color="#ef9a9a", edgecolor="white")
+    ax.set_xlabel("% tiro en ventana")
+    ax.set_title(col, fontsize=10)
+    ax.grid(axis="x", alpha=0.3)
+
+plt.suptitle("Tasa de tiro por variable categórica (%)", fontsize=12, y=1.01)
+plt.tight_layout()
+plt.show()
+```
+
+### 10.7 Mapa de numeración de zonas
+
+La variable `loss_zone_bin` divide el campo en una rejilla `PITCH_BINS_X x PITCH_BINS_Y`. El sistema está normalizado desde el punto de vista del equipo que pierde: `x = 0` es su portería propia y `x = 120` la portería rival.
+
+```{python}
+_bin_rows = []
+for ix in range(PITCH_BINS_X):
+    for iy in range(PITCH_BINS_Y):
+        _bin_id = ix * PITCH_BINS_Y + iy + 1
+        _bin_rows.append({
+            "loss_zone_bin": _bin_id,
+            "x_min": ix * (_SB_LENGTH_FOR_BINS / PITCH_BINS_X),
+            "x_max": (ix + 1) * (_SB_LENGTH_FOR_BINS / PITCH_BINS_X),
+            "y_min": iy * (_SB_WIDTH_FOR_BINS / PITCH_BINS_Y),
+            "y_max": (iy + 1) * (_SB_WIDTH_FOR_BINS / PITCH_BINS_Y),
+        })
+_bin_map = pd.DataFrame(_bin_rows)
+display(_bin_map)
+
+from matplotlib.patches import Rectangle
+from mplsoccer import Pitch
+
+pitch = Pitch(pitch_type="statsbomb", pitch_color="white",
+              line_color="#666666", goal_type="box", linewidth=1.2)
+fig, ax = pitch.draw(figsize=(10, 6))
+for _, r in _bin_map.iterrows():
+    ax.add_patch(Rectangle(
+        (r["x_min"], r["y_min"]),
+        r["x_max"] - r["x_min"],
+        r["y_max"] - r["y_min"],
+        fill=False, edgecolor="#333333", linewidth=1.0, zorder=3,
+    ))
+    ax.text(
+        (r["x_min"] + r["x_max"]) / 2,
+        (r["y_min"] + r["y_max"]) / 2,
+        str(int(r["loss_zone_bin"])),
+        ha="center", va="center", fontsize=11, fontweight="bold",
+        color="#111111", zorder=4,
+    )
+ax.set_title("Numeración de loss_zone_bin (equipo que pierde ataca hacia la derecha)")
+plt.tight_layout()
+plt.show()
+```
+
+## 11. Regresión logística
+
+Modelo lineal interpretable para estimar la probabilidad de que una pérdida genere un tiro del rival dentro de la ventana `SHOT_WINDOW_SECONDS`.
+
+Variables de entrada: `logistic_regression_dataset`. Si existen datos 360, el dataset usa las filas con contexto espacial completo; si la competición no dispone de 360, se entrena un baseline con las variables de evento y localización disponibles. Estrategia de evaluación: split 60/20/20 estratificado (train/val/test). El umbral de decisión se optimiza maximizando F1 en el conjunto de validación; el conjunto de test se usa **una única vez** para reportar resultados finales.
+
+### Métricas utilizadas y cómo se calculan
+
+A partir de las predicciones binarias se construye la matriz de confusión, formada por:
+
+- **TP** (verdaderos positivos): pérdidas en las que el modelo predice "termina en tiro" y efectivamente lo hace.
+- **FP** (falsos positivos): pérdidas que el modelo marca como peligrosas pero que no acaban en tiro.
+- **FN** (falsos negativos): pérdidas que el modelo no detecta pero sí terminan en tiro.
+- **TN** (verdaderos negativos): pérdidas que el modelo descarta y efectivamente no acaban en tiro.
+
+Sobre esta matriz se calculan las métricas que aparecen en las tablas y gráficos:
+
+- **Precisión** = $\dfrac{TP}{TP + FP}$. Responde a "de las pérdidas que el modelo señala como peligrosas, ¿qué fracción realmente acaba en tiro?". Una precisión alta significa pocas falsas alarmas.
+- **Recall** (sensibilidad) = $\dfrac{TP}{TP + FN}$. Responde a "de todas las pérdidas que sí terminan en tiro, ¿qué fracción captura el modelo?". Un recall alto significa que se escapan pocas pérdidas peligrosas.
+- **F1** = $\dfrac{2 \cdot \text{Precisión} \cdot \text{Recall}}{\text{Precisión} + \text{Recall}}$. Es la media armónica de ambas y penaliza los desequilibrios: solo es alta si las dos lo son.
+- **ROC-AUC**: área bajo la curva ROC (TPR frente a FPR al variar el umbral). Mide la capacidad del modelo de ordenar correctamente positivos y negativos, independientemente del umbral elegido.
+- **Average Precision (AP)**: área bajo la curva Precisión-Recall. Es más informativa que ROC-AUC cuando la clase positiva es minoritaria, como ocurre aquí (la mayoría de pérdidas no acaban en tiro).
+
+Como la prevalencia de la clase positiva es baja, la métrica principal de comparación es `average_precision`. La precisión y el recall del classification report dependen del umbral elegido, por eso ese umbral se busca maximizando F1 sobre el conjunto de validación antes de aplicarlo al conjunto de test.
+
+### 11.1 Split, pipeline y entrenamiento
+
+```{python}
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    classification_report, roc_auc_score, precision_recall_curve,
+    average_precision_score, confusion_matrix, ConfusionMatrixDisplay,
+    f1_score,
+)
+
+_lr_df = logistic_regression_dataset.dropna(subset=[TARGET_COL]).copy()
+X_lr_all = _lr_df.drop(columns=[TARGET_COL])
+y_lr_all = _lr_df[TARGET_COL].astype(int)
+
+_lr_class_counts = y_lr_all.value_counts().sort_index()
+_can_run_lr = len(_lr_df) >= 2 and y_lr_all.nunique() == 2
+
+if not _can_run_lr:
+    print(
+        "Regresión logística omitida: el dataset de modelado no contiene al menos "
+        "dos clases. Revisa la cobertura 360 y el filtro LOSING_TEAM_FILTER."
+    )
+    print(f"Filas disponibles: {len(_lr_df):,}")
+    print("Distribución del target:")
+    display(_lr_class_counts.rename({0: "Sin tiro (0)", 1: "Con tiro (1)"}))
+else:
+    # Split 60 / 20 / 20 estratificado cuando la muestra lo permite.
+    # Si hay pocos positivos/negativos, se usa una partición adaptativa para
+    # mantener el entrenamiento y dejar claro que la evaluación es exploratoria.
+    try:
+        X_lr_tv, X_lr_test, y_lr_tv, y_lr_test = train_test_split(
+            X_lr_all, y_lr_all, test_size=0.20, random_state=42, stratify=y_lr_all
+        )
+        X_lr_train, X_lr_val, y_lr_train, y_lr_val = train_test_split(
+            X_lr_tv, y_lr_tv, test_size=0.25, random_state=42, stratify=y_lr_tv
+        )   # 0.25 * 0.80 = 0.20 del total -> train=60%, val=20%, test=20%
+        _lr_split_note = "Split 60/20/20 estratificado."
+    except ValueError as _split_err:
+        print(f"Split estratificado no viable ({_split_err}).")
+        print("Se entrena el modelo con toda la muestra y se usa validación in-sample exploratoria.")
+        X_lr_train, y_lr_train = X_lr_all, y_lr_all
+        X_lr_val, y_lr_val = X_lr_all, y_lr_all
+        X_lr_test, y_lr_test = X_lr_all, y_lr_all
+        _lr_split_note = "Validación in-sample por muestra pequeña."
+
+    print(_lr_split_note)
+    print(f"Train: {len(X_lr_train):,}  Val: {len(X_lr_val):,}  Test: {len(X_lr_test):,}")
+    print(f"Positivos — Train: {y_lr_train.sum()}  Val: {y_lr_val.sum()}  Test: {y_lr_test.sum()}")
+```
+
+```{python}
+_cat_lr = ["loss_zone_bin"]
+_num_lr = [c for c in X_lr_all.columns if c not in _cat_lr]
+
+if _can_run_lr:
+    _lr_preproc = ColumnTransformer([
+        ("num", Pipeline([
+            ("imp", SimpleImputer(strategy="median")),
+            ("scl", StandardScaler()),
+        ]), _num_lr),
+        ("cat", Pipeline([
+            ("imp", SimpleImputer(strategy="most_frequent")),
+            ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ]), _cat_lr),
+    ], remainder="drop")
+
+    lr_pipe = Pipeline([
+        ("prep", _lr_preproc),
+        ("clf", LogisticRegression(
+            max_iter=1000,
+            class_weight="balanced",
+            solver="lbfgs",
+            C=1.0,
+            random_state=42,
+        )),
+    ])
+
+    lr_pipe.fit(X_lr_train, y_lr_train)
+    print("Regresión logística entrenada.")
+else:
+    print("Pipeline de regresión logística no entrenado.")
+```
+
+### 11.2 Optimización del umbral en validación
+
+```{python}
+if _can_run_lr:
+    _proba_lr_val = lr_pipe.predict_proba(X_lr_val)[:, 1]
+    _prec_lr, _rec_lr, _thr_lr = precision_recall_curve(y_lr_val, _proba_lr_val)
+    _f1_lr = (
+        2 * _prec_lr[:-1] * _rec_lr[:-1]
+        / (_prec_lr[:-1] + _rec_lr[:-1] + 1e-9)
+    )
+    _best_lr = int(_f1_lr.argmax())
+    lr_threshold = float(_thr_lr[_best_lr])
+    print(f"Umbral óptimo (val): {lr_threshold:.4f}  "
+          f"Prec={_prec_lr[_best_lr]:.3f}  Rec={_rec_lr[_best_lr]:.3f}  "
+          f"F1={_f1_lr[_best_lr]:.3f}")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(_rec_lr, _prec_lr, lw=2, color="#1565c0", label="LR")
+    ax.scatter(_rec_lr[_best_lr], _prec_lr[_best_lr], s=150, c="red", zorder=5,
+               label=f"Umbral={lr_threshold:.2f}")
+    ax.set_xlabel("Recall"); ax.set_ylabel("Precisión")
+    ax.set_title("Curva Precisión-Recall — validación (LR)")
+    ax.legend(); ax.grid(alpha=0.3)
+    plt.tight_layout(); plt.show()
+else:
+    print("Optimización de umbral omitida.")
+```
+
+### 11.3 Evaluación en test (una sola vez)
+
+```{python}
+if _can_run_lr:
+    _proba_lr_test = lr_pipe.predict_proba(X_lr_test)[:, 1]
+    _pred_lr_test = (_proba_lr_test >= lr_threshold).astype(int)
+
+    print(f"ROC-AUC (test): {roc_auc_score(y_lr_test, _proba_lr_test):.4f}")
+    print(f"AP      (test): {average_precision_score(y_lr_test, _proba_lr_test):.4f}")
+    print(f"\nClassification report (test, umbral={lr_threshold:.2f}):")
+    print(classification_report(y_lr_test, _pred_lr_test, digits=3))
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ConfusionMatrixDisplay(confusion_matrix(y_lr_test, _pred_lr_test)).plot(ax=ax, colorbar=False)
+    ax.set_title(f"Matriz de confusión — LR (umbral={lr_threshold:.2f})")
+    plt.tight_layout(); plt.show()
+else:
+    print("Evaluación en test omitida.")
+```
+
+### 11.4 Coeficientes del modelo
+
+```{python}
+if _can_run_lr:
+    _ohe_names_lr = list(
+        lr_pipe.named_steps["prep"]
+        .named_transformers_["cat"]
+        .named_steps["ohe"]
+        .get_feature_names_out(_cat_lr)
+    )
+    _feat_lr = _num_lr + _ohe_names_lr
+    _coef_lr = lr_pipe.named_steps["clf"].coef_[0]
+
+    _coef_df = (
+        pd.DataFrame({"feature": _feat_lr, "coef": _coef_lr})
+        .assign(abs_coef=lambda d: d["coef"].abs())
+        .sort_values("abs_coef", ascending=False)
+        .head(20)
+    )
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    _colors_lr = ["#c62828" if c > 0 else "#1565c0" for c in _coef_df["coef"]]
+    ax.barh(_coef_df["feature"][::-1], _coef_df["coef"][::-1], color=_colors_lr[::-1])
+    ax.axvline(0, color="black", linewidth=0.8)
+    ax.set_xlabel("Coeficiente (escala estandarizada)")
+    ax.set_title("Top 20 coeficientes — Regresión Logística")
+    ax.grid(axis="x", alpha=0.3)
+    plt.tight_layout(); plt.show()
+
+    display(_coef_df)
+else:
+    print("Coeficientes no disponibles porque el modelo no se ha entrenado.")
+```
+
+## 12. Random Forest
+
+Modelo de ensamble que captura interacciones no lineales entre variables.
+
+Variables de entrada: `random_forest_dataset` (incluye variables categóricas de equipo y variables contextuales que se omiten en la LR para evitar multicolinealidad). Misma estrategia de evaluación: 60/20/20 con optimización de umbral en validación.
+
+### 12.1 Split, pipeline y entrenamiento
+
+```{python}
+from sklearn.ensemble import RandomForestClassifier
+
+_rf_df = random_forest_dataset.dropna(subset=[TARGET_COL]).copy()
+X_rf_all = _rf_df.drop(columns=[TARGET_COL])
+y_rf_all = _rf_df[TARGET_COL].astype(int)
+
+_rf_class_counts = y_rf_all.value_counts().sort_index()
+_can_run_rf = len(_rf_df) >= 2 and y_rf_all.nunique() == 2
+
+if not _can_run_rf:
+    print(
+        "Random Forest omitido: el dataset de modelado no contiene al menos "
+        "dos clases. Revisa la cobertura 360 y el filtro LOSING_TEAM_FILTER."
+    )
+    print(f"Filas disponibles: {len(_rf_df):,}")
+    print("Distribución del target:")
+    display(_rf_class_counts.rename({0: "Sin tiro (0)", 1: "Con tiro (1)"}))
+else:
+    try:
+        X_rf_tv, X_rf_test, y_rf_tv, y_rf_test = train_test_split(
+            X_rf_all, y_rf_all, test_size=0.20, random_state=42, stratify=y_rf_all
+        )
+        X_rf_train, X_rf_val, y_rf_train, y_rf_val = train_test_split(
+            X_rf_tv, y_rf_tv, test_size=0.25, random_state=42, stratify=y_rf_tv
+        )
+        _rf_split_note = "Split 60/20/20 estratificado."
+    except ValueError as _split_err:
+        print(f"Split estratificado no viable ({_split_err}).")
+        print("Se entrena el modelo con toda la muestra y se usa validación in-sample exploratoria.")
+        X_rf_train, y_rf_train = X_rf_all, y_rf_all
+        X_rf_val, y_rf_val = X_rf_all, y_rf_all
+        X_rf_test, y_rf_test = X_rf_all, y_rf_all
+        _rf_split_note = "Validación in-sample por muestra pequeña."
+
+    print(_rf_split_note)
+    print(f"Train: {len(X_rf_train):,}  Val: {len(X_rf_val):,}  Test: {len(X_rf_test):,}")
+    print(f"Positivos — Train: {y_rf_train.sum()}  Val: {y_rf_val.sum()}  Test: {y_rf_test.sum()}")
+```
+
+```{python}
+_cat_rf = ["loss_zone_bin", "turnover_action_type", "turnover_event_source",
+           "lost_possession_play_pattern", "transition_play_pattern",
+           "sample_group", "competition", "season", "losing_team", "transition_team",
+           "losing_team_score_state"]
+_cat_rf = [c for c in _cat_rf if c in X_rf_all.columns]
+_num_rf = [c for c in X_rf_all.columns if c not in _cat_rf]
+
+if _can_run_rf:
+    _rf_preproc = ColumnTransformer([
+        ("num", SimpleImputer(strategy="median"), _num_rf),
+        ("cat", Pipeline([
+            ("imp", SimpleImputer(strategy="most_frequent")),
+            ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ]), _cat_rf),
+    ], remainder="drop")
+
+    rf_pipe = Pipeline([
+        ("prep", _rf_preproc),
+        ("clf", RandomForestClassifier(
+            n_estimators=300,
+            max_depth=None,
+            min_samples_leaf=5,
+            class_weight="balanced_subsample",
+            random_state=42,
+            n_jobs=-1,
+        )),
+    ])
+
+    rf_pipe.fit(X_rf_train, y_rf_train)
+    print("Random Forest entrenado.")
+else:
+    print("Pipeline de Random Forest no entrenado.")
+```
+
+### 12.2 Optimización del umbral en validación
+
+```{python}
+if _can_run_rf:
+    _proba_rf_val = rf_pipe.predict_proba(X_rf_val)[:, 1]
+    _prec_rf, _rec_rf, _thr_rf = precision_recall_curve(y_rf_val, _proba_rf_val)
+    _f1_rf = (
+        2 * _prec_rf[:-1] * _rec_rf[:-1]
+        / (_prec_rf[:-1] + _rec_rf[:-1] + 1e-9)
+    )
+    _best_rf = int(_f1_rf.argmax())
+    rf_threshold = float(_thr_rf[_best_rf])
+    print(f"Umbral óptimo (val): {rf_threshold:.4f}  "
+          f"Prec={_prec_rf[_best_rf]:.3f}  Rec={_rec_rf[_best_rf]:.3f}  "
+          f"F1={_f1_rf[_best_rf]:.3f}")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(_rec_rf, _prec_rf, lw=2, color="#2e7d32", label="RF")
+    ax.scatter(_rec_rf[_best_rf], _prec_rf[_best_rf], s=150, c="red", zorder=5,
+               label=f"Umbral={rf_threshold:.2f}")
+    ax.set_xlabel("Recall"); ax.set_ylabel("Precisión")
+    ax.set_title("Curva Precisión-Recall — validación (RF)")
+    ax.legend(); ax.grid(alpha=0.3)
+    plt.tight_layout(); plt.show()
+else:
+    print("Optimización de umbral omitida.")
+```
+
+### 12.3 Evaluación en test (una sola vez)
+
+```{python}
+if _can_run_rf:
+    _proba_rf_test = rf_pipe.predict_proba(X_rf_test)[:, 1]
+    _pred_rf_test = (_proba_rf_test >= rf_threshold).astype(int)
+
+    print(f"ROC-AUC (test): {roc_auc_score(y_rf_test, _proba_rf_test):.4f}")
+    print(f"AP      (test): {average_precision_score(y_rf_test, _proba_rf_test):.4f}")
+    print(f"\nClassification report (test, umbral={rf_threshold:.2f}):")
+    print(classification_report(y_rf_test, _pred_rf_test, digits=3))
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ConfusionMatrixDisplay(confusion_matrix(y_rf_test, _pred_rf_test)).plot(ax=ax, colorbar=False)
+    ax.set_title(f"Matriz de confusión — RF (umbral={rf_threshold:.2f})")
+    plt.tight_layout(); plt.show()
+else:
+    print("Evaluación en test omitida.")
+```
+
+### 12.4 Importancia de variables
+
+La importancia que reporta `RandomForestClassifier.feature_importances_` se calcula como **mean decrease impurity (MDI)**: para cada variable se promedia, sobre todos los árboles del bosque, la reducción ponderada de impureza (Gini, en este caso) que producen los splits que la usan. Variables que aparecen en splits cercanos a la raíz y separan bien las clases reciben valores altos. Es una medida rápida y útil para ordenar variables, pero tiene limitaciones conocidas: tiende a sobrevalorar variables continuas o con muchas categorías y se calcula sobre el conjunto de entrenamiento, por lo que puede inflar la importancia de variables que ayudaron a sobreajustar. Para una visión complementaria, la sección 14 utiliza SHAP, que sí refleja contribuciones por observación.
+
+```{python}
+if _can_run_rf:
+    _feat_rf = list(rf_pipe.named_steps["prep"].get_feature_names_out())
+    _imp_rf  = rf_pipe.named_steps["clf"].feature_importances_
+    if len(_feat_rf) != len(_imp_rf):
+        print(
+            "⚠ No coinciden nombres e importancias RF "
+            f"({len(_feat_rf)} vs {len(_imp_rf)}). Se usan nombres genéricos."
+        )
+        _feat_rf = [f"feature_{i}" for i in range(len(_imp_rf))]
+
+    _imp_df = (
+        pd.DataFrame({"feature": _feat_rf, "importance": _imp_rf})
+        .sort_values("importance", ascending=False)
+        .head(20)
+    )
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.barh(_imp_df["feature"][::-1], _imp_df["importance"][::-1], color="#2e7d32")
+    ax.set_xlabel("Importancia (mean decrease impurity)")
+    ax.set_title("Top 20 variables — Random Forest")
+    ax.grid(axis="x", alpha=0.3)
+    plt.tight_layout(); plt.show()
+
+    display(_imp_df)
+else:
+    print("Importancias no disponibles porque el modelo no se ha entrenado.")
+```
+
+## 13. Comparación por fútbol femenino y masculino
+
+Para comparar si los modelos rinden mejor en fútbol femenino o masculino, se entrena cada modelo de forma independiente dentro de cada grupo (`sample_group`). La comparación usa el mismo esquema 60/20/20, el mismo criterio de optimización de umbral en validación y el mismo conjunto de métricas en test.
+
+Además de las métricas ya definidas en la sección 11 (precisión, recall, F1, ROC-AUC, AP), aquí se reporta:
+
+- **Accuracy** = $\dfrac{TP + TN}{TP + TN + FP + FN}$. Proporción de predicciones correctas. Es engañosa cuando hay desbalance de clases: un modelo que siempre dice "no hay tiro" puede acertar el 90% si solo el 10% de las pérdidas terminan en tiro.
+- **Balanced accuracy** = $\dfrac{1}{2}\left(\dfrac{TP}{TP+FN} + \dfrac{TN}{TN+FP}\right)$, es decir, la media entre recall de la clase positiva (sensibilidad) y recall de la clase negativa (especificidad). Es más informativa que la accuracy con clases desbalanceadas porque trata ambas clases por igual.
+
+```{python}
+from sklearn.metrics import precision_score, recall_score, accuracy_score, balanced_accuracy_score
+
+
+def _split_train_val_test(X, y, random_state=42):
+    try:
+        X_tv, X_test, y_tv, y_test = train_test_split(
+            X, y, test_size=0.20, random_state=random_state, stratify=y
+        )
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_tv, y_tv, test_size=0.25, random_state=random_state, stratify=y_tv
+        )
+        note = "60/20/20 estratificado"
+    except ValueError:
+        X_train, y_train = X, y
+        X_val, y_val = X, y
+        X_test, y_test = X, y
+        note = "in-sample exploratorio"
+    return X_train, X_val, X_test, y_train, y_val, y_test, note
+
+
+def _best_threshold_from_validation(pipe, X_val, y_val):
+    proba_val = pipe.predict_proba(X_val)[:, 1]
+    prec, rec, thr = precision_recall_curve(y_val, proba_val)
+    if len(thr) == 0:
+        return 0.5
+    f1 = 2 * prec[:-1] * rec[:-1] / (prec[:-1] + rec[:-1] + 1e-9)
+    return float(thr[int(f1.argmax())])
+
+
+def _safe_roc_auc(y_true, proba):
+    return roc_auc_score(y_true, proba) if pd.Series(y_true).nunique() == 2 else np.nan
+
+
+def _fit_group_model(df, feature_cols, model_kind, group_name):
+    d = df[df["sample_group"] == group_name].copy()
+    _cols = list(dict.fromkeys([c for c in feature_cols if c in d.columns]))
+    d = d[_cols].dropna(subset=[TARGET_COL])
+    if len(d) < 2 or d[TARGET_COL].nunique() < 2:
+        return None
+
+    _metadata_cols = [c for c in ["sample_group", "match_id"] if c in d.columns]
+    X = d.drop(columns=[TARGET_COL] + _metadata_cols)
+    y = d[TARGET_COL].astype(int)
+    X_train, X_val, X_test, y_train, y_val, y_test, split_note = _split_train_val_test(X, y)
+
+    if model_kind == "Regresión logística":
+        cat_cols = [c for c in ["loss_zone_bin"] if c in X.columns]
+        num_cols = [c for c in X.columns if c not in cat_cols]
+        prep = ColumnTransformer([
+            ("num", Pipeline([
+                ("imp", SimpleImputer(strategy="median")),
+                ("scl", StandardScaler()),
+            ]), num_cols),
+            ("cat", Pipeline([
+                ("imp", SimpleImputer(strategy="most_frequent")),
+                ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+            ]), cat_cols),
+        ], remainder="drop")
+        clf = LogisticRegression(
+            max_iter=1000,
+            class_weight="balanced",
+            solver="lbfgs",
+            C=1.0,
+            random_state=42,
+        )
+    else:
+        cat_cols = [
+            "loss_zone_bin", "turnover_action_type", "turnover_event_source",
+            "lost_possession_play_pattern", "transition_play_pattern",
+            "competition", "season", "losing_team", "transition_team",
+            "losing_team_score_state",
+        ]
+        cat_cols = [c for c in cat_cols if c in X.columns]
+        num_cols = [c for c in X.columns if c not in cat_cols]
+        prep = ColumnTransformer([
+            ("num", SimpleImputer(strategy="median"), num_cols),
+            ("cat", Pipeline([
+                ("imp", SimpleImputer(strategy="most_frequent")),
+                ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+            ]), cat_cols),
+        ], remainder="drop")
+        clf = RandomForestClassifier(
+            n_estimators=300,
+            min_samples_leaf=5,
+            class_weight="balanced_subsample",
+            random_state=42,
+            n_jobs=-1,
+        )
+
+    pipe = Pipeline([("prep", prep), ("clf", clf)])
+    pipe.fit(X_train, y_train)
+
+    threshold = _best_threshold_from_validation(pipe, X_val, y_val)
+    proba_test = pipe.predict_proba(X_test)[:, 1]
+    pred_test = (proba_test >= threshold).astype(int)
+
+    return {
+        "grupo": group_name,
+        "modelo": model_kind,
+        "split": split_note,
+        "partidos": int(d["match_id"].nunique()) if "match_id" in d.columns else np.nan,
+        "observaciones": int(len(d)),
+        "positivos": int(y.sum()),
+        "prevalencia": float(y.mean()),
+        "test_n": int(len(y_test)),
+        "test_positivos": int(y_test.sum()),
+        "umbral": threshold,
+        "roc_auc": float(_safe_roc_auc(y_test, proba_test)),
+        "average_precision": float(average_precision_score(y_test, proba_test)),
+        "precision": float(precision_score(y_test, pred_test, zero_division=0)),
+        "recall": float(recall_score(y_test, pred_test, zero_division=0)),
+        "f1": float(f1_score(y_test, pred_test, zero_division=0)),
+        "accuracy": float(accuracy_score(y_test, pred_test)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_test, pred_test)),
+    }
+
+
+_comparison_rows = []
+for _group_name in sorted(model_dataset_modeling["sample_group"].dropna().unique()):
+    _lr_res = _fit_group_model(
+        model_dataset_modeling,
+        logistic_regression_cols + ["sample_group", "match_id"],
+        "Regresión logística",
+        _group_name,
+    )
+    _rf_res = _fit_group_model(
+        model_dataset_modeling,
+        random_forest_cols + ["sample_group", "match_id"],
+        "Random Forest",
+        _group_name,
+    )
+    if _lr_res is not None:
+        _comparison_rows.append(_lr_res)
+    if _rf_res is not None:
+        _comparison_rows.append(_rf_res)
+
+model_gender_comparison = pd.DataFrame(_comparison_rows)
+
+if model_gender_comparison.empty:
+    print("No hay datos suficientes para entrenar modelos separados por grupo.")
+else:
+    _display_cols = [
+        "grupo", "modelo", "partidos", "observaciones", "positivos", "prevalencia",
+        "test_n", "test_positivos", "roc_auc", "average_precision",
+        "precision", "recall", "f1", "balanced_accuracy", "umbral", "split",
+    ]
+    display(
+        model_gender_comparison[_display_cols]
+        .sort_values(["modelo", "grupo"])
+        .style.format({
+            "prevalencia": "{:.2%}",
+            "roc_auc": "{:.3f}",
+            "average_precision": "{:.3f}",
+            "precision": "{:.3f}",
+            "recall": "{:.3f}",
+            "f1": "{:.3f}",
+            "balanced_accuracy": "{:.3f}",
+            "umbral": "{:.3f}",
+        })
+    )
+```
+
+```{python}
+if not model_gender_comparison.empty:
+    _plot_metrics = ["roc_auc", "average_precision", "f1", "balanced_accuracy"]
+    fig, axes = plt.subplots(1, len(_plot_metrics), figsize=(13, 3.8), sharey=False)
+    for ax, metric in zip(axes, _plot_metrics):
+        _pivot = (
+            model_gender_comparison
+            .pivot(index="modelo", columns="grupo", values=metric)
+            .sort_index()
+        )
+        _pivot.plot(kind="bar", ax=ax, width=0.75)
+        ax.set_title(metric)
+        ax.set_xlabel("")
+        ax.set_ylim(0, max(1.0, float(np.nanmax(_pivot.values)) * 1.15))
+        ax.grid(axis="y", alpha=0.25)
+        ax.legend(title="")
+    plt.suptitle("Comparación de rendimiento por muestra", y=1.04)
+    plt.tight_layout()
+    plt.show()
+```
+
+Lectura recomendada: la métrica principal para comparar estos modelos debe ser `average_precision`, porque el evento positivo es minoritario. `ROC-AUC` puede parecer estable incluso con clases desbalanceadas; `AP`, `recall`, `precision` y `F1` muestran mejor si el modelo está encontrando realmente las pérdidas que terminan en tiro.
+
+## 14. Interpretabilidad con SHAP
+
+SHAP (SHapley Additive exPlanations) descompone cada predicción individual como una suma de contribuciones por variable. La idea procede de la teoría de juegos cooperativos: el valor SHAP de una variable es el cambio promedio que provoca en la predicción cuando se "añade" al conjunto de variables ya consideradas, promediando sobre todas las posibles ordenaciones. Para una observación concreta:
+
+$$\hat{p}(x) = \phi_0 + \sum_{j=1}^{p} \phi_j(x)$$
+
+donde $\phi_0$ es la predicción media del modelo (el valor base) y $\phi_j(x)$ es la contribución de la variable $j$ a esa predicción concreta.
+
+**Cómo interpretar los valores SHAP**
+
+- **Signo**: un valor SHAP positivo indica que la variable empuja la predicción *hacia arriba* (más probabilidad de tiro tras pérdida); un valor negativo la empuja *hacia abajo*.
+- **Magnitud**: el valor absoluto mide el peso de esa variable en esa observación. La media de los valores absolutos a lo largo del dataset da la importancia global de cada variable.
+- **Beeswarm**: en el gráfico de enjambre cada punto es una observación. El eje horizontal es el valor SHAP; el color codifica el valor original de la variable (azul = bajo, rosa = alto). Si los puntos rosa caen a la derecha, significa que valores altos de la variable aumentan la probabilidad estimada. Si caen a la izquierda, valores altos la reducen.
+- **Familias tácticas**: agregar los SHAP por familia de variables (localización, zona inmediata, última línea, corredor, contexto, evento) permite ver qué bloque conceptual aporta más a la decisión del modelo.
+
+A diferencia de los coeficientes de la regresión logística (que son globales y lineales) o de la importancia por permutación (que mide la pérdida de calidad cuando se rompe una variable), SHAP atribuye contribuciones *locales y consistentes* compatibles con efectos no lineales e interacciones, por lo que sirve tanto para interpretar el modelo en general como para explicar predicciones individuales.
+
+En este bloque calculamos valores SHAP para los modelos entrenados y los resumimos en dos niveles: importancia de variables individuales y contribución agregada por familias tácticas.
+
+```{python}
+try:
+    import shap
+    _SHAP_AVAILABLE = True
+except Exception as _shap_exc:
+    shap = None
+    _SHAP_AVAILABLE = False
+    print(
+        "SHAP no está disponible en este entorno. "
+        "Para activar esta sección instala de forma controlada: "
+        'pip install "numpy<2" "shap<0.50"'
+    )
+    print(f"Detalle: {_shap_exc}")
+
+def _transformed_feature_names(preprocessor):
+    names = []
+    for name, transformer, cols in preprocessor.transformers_:
+        if name == "remainder" and transformer == "drop":
+            continue
+        if transformer == "drop":
+            continue
+        if isinstance(cols, slice):
+            continue
+
+        cols = list(cols)
+        if isinstance(transformer, Pipeline):
+            last_step = transformer.steps[-1][1]
+            if hasattr(last_step, "get_feature_names_out"):
+                names.extend(list(last_step.get_feature_names_out(cols)))
+            else:
+                names.extend(cols)
+        elif hasattr(transformer, "get_feature_names_out"):
+            names.extend(list(transformer.get_feature_names_out(cols)))
+        else:
+            names.extend(cols)
+    return names
+
+
+def _feature_family(feature):
+    base = str(feature)
+    if base.startswith("loss_zone_bin") or base in {"loss_x", "loss_y"}:
+        return "Localización"
+    if base in {"loss_dist_to_own_goal_m", "loss_angle_to_own_goal_rad"}:
+        return "Localización"
+    if base.startswith("zone_") or base in {
+        "nearest_defender_dist_m", "defenders_goalside_in_zone",
+    }:
+        return "Zona inmediata"
+    if base.startswith("last_line_") or base.startswith("last_def_"):
+        return "Última línea"
+    if base.startswith("corridor_"):
+        return "Corredor"
+    if (
+        base.startswith("turnover_")
+        or "play_pattern" in base
+        or base in {"under_pressure", "counterpress"}
+    ):
+        return "Evento"
+    if (
+        "score" in base
+        or "players" in base
+        or base == "action_minute"
+        or base == "transition_team_player_diff"
+    ):
+        return "Contexto"
+    if base.startswith("losing_team") or base.startswith("transition_team"):
+        return "Equipo"
+    return "Otros"
+
+
+def _as_dense(matrix):
+    return matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
+
+
+def _compute_pipeline_shap(pipe, X, model_name, max_rows=600):
+    if len(X) == 0:
+        return None
+
+    X_sample = X.sample(min(max_rows, len(X)), random_state=42).copy()
+    prep = pipe.named_steps["prep"]
+    clf = pipe.named_steps["clf"]
+
+    Xt_all = _as_dense(prep.transform(X))
+    Xt = _as_dense(prep.transform(X_sample))
+    feature_names = _transformed_feature_names(prep)
+
+    # Fondo pequeño para que el render no sea excesivamente lento.
+    bg_n = min(200, Xt_all.shape[0])
+    rng = np.random.default_rng(42)
+    bg_idx = rng.choice(Xt_all.shape[0], size=bg_n, replace=False)
+    background = pd.DataFrame(Xt_all[bg_idx], columns=feature_names)
+    Xt_df = pd.DataFrame(Xt, columns=feature_names)
+
+    try:
+        if isinstance(clf, LogisticRegression):
+            explainer = shap.LinearExplainer(clf, background)
+            shap_values = explainer(Xt_df).values
+        elif isinstance(clf, RandomForestClassifier):
+            explainer = shap.TreeExplainer(clf)
+            raw_values = explainer.shap_values(Xt_df)
+            if isinstance(raw_values, list):
+                shap_values = raw_values[1]
+            elif np.asarray(raw_values).ndim == 3:
+                shap_values = np.asarray(raw_values)[:, :, 1]
+            else:
+                shap_values = np.asarray(raw_values)
+        else:
+            explainer = shap.Explainer(clf, background)
+            shap_values = explainer(Xt_df).values
+    except Exception as exc:
+        print(f"No se pudieron calcular SHAP para {model_name}: {exc}")
+        return None
+
+    mean_abs = np.abs(shap_values).mean(axis=0)
+    total = mean_abs.sum()
+    if total == 0:
+        print(f"SHAP sin variación para {model_name}.")
+        return None
+
+    rank = (
+        pd.DataFrame({
+            "model": model_name,
+            "feature": feature_names,
+            "mean_abs_shap": mean_abs,
+        })
+        .assign(
+            shap_pct=lambda d: 100 * d["mean_abs_shap"] / d["mean_abs_shap"].sum(),
+            category=lambda d: d["feature"].map(_feature_family),
+        )
+        .sort_values("mean_abs_shap", ascending=False)
+        .reset_index(drop=True)
+    )
+    rank["rank"] = np.arange(1, len(rank) + 1)
+    rank["cumulative_pct"] = rank["shap_pct"].cumsum()
+
+    category = (
+        rank.groupby("category", as_index=False)
+        .agg(shap_pct=("shap_pct", "sum"))
+        .sort_values("shap_pct", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    return {
+        "model": model_name,
+        "X_values": Xt_df,
+        "shap_values": shap_values,
+        "rank": rank,
+        "category": category,
+    }
+
+
+def _plot_shap_beeswarm(shap_result, top_n=20):
+    rank = shap_result["rank"].head(top_n)
+    features = rank["feature"].tolist()[::-1]
+    shap_values = shap_result["shap_values"]
+    X_values = shap_result["X_values"]
+    feature_to_idx = {f: i for i, f in enumerate(X_values.columns)}
+
+    fig, ax = plt.subplots(figsize=(9, max(5, 0.33 * len(features))))
+    rng = np.random.default_rng(42)
+
+    for y_pos, feature in enumerate(features):
+        idx = feature_to_idx[feature]
+        vals = X_values[feature].to_numpy()
+        sv = shap_values[:, idx]
+        if np.nanmax(vals) > np.nanmin(vals):
+            color_vals = (vals - np.nanmin(vals)) / (np.nanmax(vals) - np.nanmin(vals))
+        else:
+            color_vals = np.full_like(vals, 0.5, dtype=float)
+        jitter = rng.normal(0, 0.08, size=len(sv))
+        sc = ax.scatter(
+            sv, np.full_like(sv, y_pos, dtype=float) + jitter,
+            c=color_vals, cmap="cool", s=12, alpha=0.85, edgecolors="none",
+        )
+
+    ax.axvline(0, color="#333333", linewidth=1)
+    ax.set_yticks(range(len(features)))
+    ax.set_yticklabels(features)
+    ax.set_xlabel("Valor SHAP (impacto sobre la salida del modelo)")
+    ax.set_title(f"SHAP feature importance — {shap_result['model']}")
+    ax.grid(axis="x", alpha=0.25)
+    cbar = plt.colorbar(sc, ax=ax, pad=0.02)
+    cbar.set_label("Valor de la variable")
+    cbar.set_ticks([0, 1])
+    cbar.set_ticklabels(["Bajo", "Alto"])
+    plt.tight_layout()
+    plt.show()
+
+
+_shap_results = []
+if _SHAP_AVAILABLE and "_can_run_lr" in globals() and _can_run_lr:
+    _lr_shap = _compute_pipeline_shap(lr_pipe, X_lr_all, "Regresión logística")
+    if _lr_shap is not None:
+        _shap_results.append(_lr_shap)
+
+if _SHAP_AVAILABLE and "_can_run_rf" in globals() and _can_run_rf:
+    _rf_shap = _compute_pipeline_shap(rf_pipe, X_rf_all, "Random Forest")
+    if _rf_shap is not None:
+        _shap_results.append(_rf_shap)
+
+if not _shap_results:
+    print("No hay modelos entrenados o SHAP no pudo calcularse.")
+```
+
+### 14.1 Ranking SHAP por variable
+
+El gráfico beeswarm que sigue ordena las 20 variables más influyentes por su importancia SHAP media (en valor absoluto). Para cada variable, cada punto es una observación del conjunto evaluado: su posición horizontal indica el valor SHAP (positivo = aumenta la probabilidad de tiro tras la pérdida; negativo = la reduce) y su color codifica el valor original de esa variable (rosa = valores altos, azul = valores bajos). La tabla complementaria muestra el porcentaje de SHAP total y el acumulado, útil para identificar cuántas variables explican, por ejemplo, el 80% del comportamiento del modelo.
+
+```{python}
+for _res in _shap_results:
+    print(f"\n{_res['model']}")
+    _plot_shap_beeswarm(_res, top_n=20)
+    _rank_display = _res["rank"][[
+        "rank", "feature", "shap_pct", "cumulative_pct", "category"
+    ]].head(25).copy()
+    _rank_display["shap_pct"] = _rank_display["shap_pct"].map(lambda x: f"{x:.2f}%")
+    _rank_display["cumulative_pct"] = _rank_display["cumulative_pct"].map(lambda x: f"{x:.2f}%")
+    display(_rank_display)
+```
+
+### 14.2 Ranking SHAP por familia de variables
+
+Esta vista agrega los valores SHAP (en valor absoluto) por familia conceptual de variables: localización, zona inmediata, última línea, corredor, contexto y evento. Permite responder a una pregunta más táctica que estadística: ¿qué bloque de variables aporta más a la decisión del modelo? Si la familia "Última línea" concentra un porcentaje alto del SHAP total, significa que la organización del fondo defensivo en el momento de la pérdida es lo que más mueve la predicción; si la familia "Localización" domina, el modelo está apoyándose sobre todo en dónde ocurre la pérdida.
+
+```{python}
+if _shap_results:
+    _cat_tables = []
+    for _res in _shap_results:
+        _cat = _res["category"].copy()
+        _cat["model"] = _res["model"]
+        _cat_tables.append(_cat)
+
+    _shap_category_df = pd.concat(_cat_tables, ignore_index=True)
+    display(
+        _shap_category_df
+        .pivot(index="category", columns="model", values="shap_pct")
+        .fillna(0)
+        .sort_index()
+        .applymap(lambda x: f"{x:.2f}%")
+    )
+
+    _plot_df = _shap_category_df.copy()
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for _model, _grp in _plot_df.groupby("model"):
+        _grp = _grp.sort_values("shap_pct", ascending=True)
+        ax.barh(_grp["category"] + " · " + _model, _grp["shap_pct"], label=_model)
+    ax.set_xlabel("SHAP % agregado")
+    ax.set_title("Contribución SHAP por familia de variables")
+    ax.grid(axis="x", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+```
+
