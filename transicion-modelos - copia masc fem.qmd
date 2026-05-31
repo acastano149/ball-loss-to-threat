@@ -532,7 +532,7 @@ def possession_meta(events):
     """Una fila por posesión: equipo, inicio y final."""
     return (
         events.dropna(subset=["possession"])
-        .sort_values(["period", "event_order"])
+        .sort_values(["match_id", "period", "event_order"])
         .groupby(["match_id", "period", "possession"], observed=True)
         .agg(
             possession_team=("possession_team", "first"),
@@ -543,13 +543,59 @@ def possession_meta(events):
             end_seconds=("event_seconds", "max"),
         )
         .reset_index()
-        .sort_values(["period", "start_order"])
+        .sort_values(["match_id", "period", "start_order"])
         .reset_index(drop=True)
     )
 
 
+def add_next_possession_columns(meta):
+    """Añade columnas next_* con la siguiente posesión del mismo partido y período."""
+    pairs = (
+        meta.sort_values(["match_id", "period", "start_order"])
+        .reset_index(drop=True)
+        .copy()
+    )
+    next_cols = [
+        "possession",
+        "possession_team",
+        "play_pattern",
+        "start_order",
+        "start_seconds",
+    ]
+    grouped = pairs.groupby(["match_id", "period"], observed=True, sort=False)
+    for col in next_cols:
+        pairs[f"next_{col}"] = grouped[col].shift(-1)
+    return pairs[pairs["next_possession"].notna()].copy()
+
+
+def pair_to_possession_series(pair):
+    """Convierte una fila current/next en las dos Series usadas por la lógica existente."""
+    current_poss = pd.Series({
+        "match_id": pair["match_id"],
+        "period": int(pair["period"]),
+        "possession": pair["possession"],
+        "possession_team": pair["possession_team"],
+        "play_pattern": pair["play_pattern"],
+        "start_order": pair["start_order"],
+        "end_order": pair["end_order"],
+        "start_seconds": pair["start_seconds"],
+        "end_seconds": pair["end_seconds"],
+    })
+    next_poss = pd.Series({
+        "match_id": pair["match_id"],
+        "period": int(pair["period"]),
+        "possession": pair["next_possession"],
+        "possession_team": pair["next_possession_team"],
+        "play_pattern": pair["next_play_pattern"],
+        "start_order": pair["next_start_order"],
+        "start_seconds": pair["next_start_seconds"],
+    })
+    return current_poss, next_poss
+
+
 meta = possession_meta(events)
-meta.head(10)
+possession_pairs = add_next_possession_columns(meta)
+possession_pairs.head(10)
 ```
 
 ## 4. Elegir la acción que explica la pérdida
@@ -897,13 +943,8 @@ def first_shot_after_turnover(events, transition_team, next_possession, t0_secon
 
 rows = []
 
-for i in range(len(meta) - 1):
-    current_poss = meta.iloc[i]
-    next_poss = meta.iloc[i + 1]
-
-    # Solo nos interesan cambios de posesión dentro del mismo período.
-    if current_poss["period"] != next_poss["period"]:
-        continue
+for _, pair in possession_pairs.iterrows():
+    current_poss, next_poss = pair_to_possession_series(pair)
 
     losing_team = current_poss["possession_team"]
     transition_team = next_poss["possession_team"]
@@ -2374,12 +2415,10 @@ def _process_match_to_context(mid, raw_ev, fz, va_lk, mrow):
 
     # Meta de posesiónes y construcción de filas
     _meta = possession_meta(_ev)
+    _pairs = add_next_possession_columns(_meta)
     _rows = []
-    for i in range(len(_meta) - 1):
-        cp = _meta.iloc[i]
-        np_ = _meta.iloc[i + 1]
-        if cp["period"] != np_["period"]:
-            continue
+    for _, _pair in _pairs.iterrows():
+        cp, np_ = pair_to_possession_series(_pair)
         lt = cp["possession_team"]
         tt = np_["possession_team"]
         if lt == tt:

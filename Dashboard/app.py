@@ -63,10 +63,14 @@ DANGER_SCOPE_CHOICES = {
 COLS_NEEDED = [
     "id", "index", "period", "timestamp", "minute", "second",
     "type", "play_pattern", "possession", "possession_team", "team",
-    "location", "under_pressure",
+    "location", "under_pressure", "out",
     "shot_outcome", "shot_statsbomb_xg",
     "ball_recovery_recovery_failure",
+    "ball_recovery_offensive",
+    "block_deflection", "block_offensive", "block_save_block",
     "interception_outcome", "duel_type", "duel_outcome",
+    "50_50_outcome",
+    "clearance_aerial_won", "clearance_body_part",
     "pass_outcome", "pass_length", "pass_angle", "pass_height", "pass_end_location", "pass_type",
     "carry_end_location",
     "dribble_outcome",
@@ -79,11 +83,27 @@ CATEGORY_COLS = [
     "type", "play_pattern", "possession_team", "team", "shot_outcome",
     "interception_outcome", "duel_type", "duel_outcome", "pass_outcome",
     "pass_height", "pass_type", "dribble_outcome", "ball_receipt_outcome",
+    "50_50_outcome",
 ]
 
 TRANSITION_RECOVERY_SUCCESS = ["Won", "Success", "Success In Play", "In Play"]
 TACKLE_SUCCESS = ["Won", "Success", "Success In Play"]
-LOSS_CANDIDATE_TYPES = ["Pass", "Carry", "Dribble", "Miscontrol", "Dispossessed", "Ball Receipt*"]
+OPEN_PLAY_NEXT_PATTERNS = {"Regular Play", "From Counter"}
+DEFENSIVE_PRIORITY = {"Block": 1, "Interception": 2, "Duel": 3, "50/50": 4, "Clearance": 5}
+ATTACKING_PRIORITY = {
+    "Miscontrol": 1,
+    "Dispossessed": 2,
+    "Dribble": 3,
+    "Pass": 4,
+    "Carry": 5,
+    "Ball Receipt*": 6,
+}
+VALID_TACKLE_OUTCOMES = {"Won", "Success", "Success In Play"}
+VALID_INTERCEPTION_OUTCOMES = {"Won", "Success", "In Play", "Success In Play"}
+VALID_50_50_OUTCOMES = {"Won", "Success To Team"}
+INCOMPLETE_PASS_OUTCOMES = {"Incomplete", "Out", "Pass Offside", "Unknown", "Injury Clearance"}
+INCOMPLETE_DRIBBLE_OUTCOMES = {"Incomplete"}
+INCOMPLETE_RECEIPT_OUTCOMES = {"Incomplete"}
 
 TEAM_COLOR_PALETTE = [
     {"bg": "#E6F1FB", "border": "#378ADD", "text": "#0C447C", "hex": "#185FA5", "cmap": "Blues"},
@@ -210,9 +230,11 @@ def _prefetch_match_events(match_ids: list) -> None:
 
 def _possession_meta(events: pd.DataFrame) -> pd.DataFrame:
     group_cols = ["match_id", "period", "possession"] if "match_id" in events.columns else ["period", "possession"]
+    sort_cols = ["match_id", "period", "event_order"] if "match_id" in events.columns else ["period", "event_order"]
+    out_sort_cols = ["match_id", "period", "start_order"] if "match_id" in events.columns else ["period", "start_order"]
     meta = (
         events.dropna(subset=["possession"])
-        .sort_values(["period", "event_order"])
+        .sort_values(sort_cols)
         .groupby(group_cols, observed=True)
         .agg(
             possession_team=("possession_team", "first"),
@@ -223,33 +245,47 @@ def _possession_meta(events: pd.DataFrame) -> pd.DataFrame:
             end_seconds=("event_seconds", "max"),
         )
         .reset_index()
+        .sort_values(out_sort_cols)
+        .reset_index(drop=True)
     )
     return meta
 
 
-def _next_possession_for_team(meta: pd.DataFrame, match_id: int, period: int, order: float, team: str):
-    candidates = meta[
-        (meta["match_id"] == match_id)
-        & (meta["period"] == period)
-        & (meta["possession_team"] == team)
-        & (meta["start_order"] > order)  # FIX: > en lugar de >= para evitar reutilizar la posesión actual
-    ].sort_values("start_order")
-    if candidates.empty:
-        return np.nan, None
-    row = candidates.iloc[0]
-    return row["possession"], row["play_pattern"]
+def _add_next_possession_columns(meta: pd.DataFrame) -> pd.DataFrame:
+    if meta.empty:
+        return meta.copy()
+    sort_cols = ["match_id", "period", "start_order"] if "match_id" in meta.columns else ["period", "start_order"]
+    group_cols = ["match_id", "period"] if "match_id" in meta.columns else ["period"]
+    pairs = meta.sort_values(sort_cols).reset_index(drop=True).copy()
+    next_cols = ["possession", "possession_team", "play_pattern", "start_order", "start_seconds"]
+    grouped = pairs.groupby(group_cols, observed=True, sort=False)
+    for col in next_cols:
+        pairs[f"next_{col}"] = grouped[col].shift(-1)
+    return pairs[pairs["next_possession"].notna()].copy()
 
 
-def _next_opponent_possession(meta: pd.DataFrame, match_id: int, period: int, order: float, team: str):
-    candidates = meta[
-        (meta["match_id"] == match_id)
-        & (meta["period"] == period)
-        & (meta["possession_team"] != team)
-        & (meta["start_order"] > order)
-    ].sort_values("start_order")
-    if candidates.empty:
-        return None
-    return candidates.iloc[0]
+def _pair_to_possession_series(pair: pd.Series):
+    current_poss = pd.Series({
+        "match_id": pair.get("match_id", pd.NA),
+        "period": int(pair["period"]),
+        "possession": pair["possession"],
+        "possession_team": pair["possession_team"],
+        "play_pattern": pair["play_pattern"],
+        "start_order": pair["start_order"],
+        "end_order": pair.get("end_order", pd.NA),
+        "start_seconds": pair["start_seconds"],
+        "end_seconds": pair.get("end_seconds", pd.NA),
+    })
+    next_poss = pd.Series({
+        "match_id": pair.get("match_id", pd.NA),
+        "period": int(pair["period"]),
+        "possession": pair["next_possession"],
+        "possession_team": pair["next_possession_team"],
+        "play_pattern": pair["next_play_pattern"],
+        "start_order": pair["next_start_order"],
+        "start_seconds": pair["next_start_seconds"],
+    })
+    return current_poss, next_poss
 
 
 def _box_entry_mask(df: pd.DataFrame) -> pd.Series:
@@ -300,6 +336,228 @@ def _danger_flags_for_target(target_events: pd.DataFrame, target_play_pattern) -
     }
 
 
+def _is_true(value) -> bool:
+    if pd.isna(value):
+        return False
+    if isinstance(value, str):
+        return value.lower() in {"true", "1", "yes", "si", "sí"}
+    return bool(value)
+
+
+def _is_restart_or_out(previous_events: pd.DataFrame, next_possession: pd.Series) -> bool:
+    if next_possession["play_pattern"] not in OPEN_PLAY_NEXT_PATTERNS:
+        return True
+    if previous_events.empty:
+        return True
+    last_event = previous_events.sort_values("event_order").iloc[-1]
+    if (previous_events["type"] == "Shot").any():
+        return True
+    if str(last_event.get("type", "")) == "Goal Keeper":
+        return True
+    if _is_true(last_event.get("out", pd.NA)):
+        return True
+    if str(last_event.get("pass_outcome", "")) in {"Out", "Pass Offside", "Injury Clearance"}:
+        return True
+    return False
+
+
+def _valid_defensive_event(event: pd.Series) -> bool:
+    event_type = event.get("type")
+    if event_type == "Duel":
+        return event.get("duel_type") == "Tackle" and str(event.get("duel_outcome")) in VALID_TACKLE_OUTCOMES
+    if event_type == "Interception":
+        return str(event.get("interception_outcome")) in VALID_INTERCEPTION_OUTCOMES or pd.isna(event.get("interception_outcome"))
+    if event_type == "50/50":
+        return str(event.get("50_50_outcome")) in VALID_50_50_OUTCOMES
+    return True
+
+
+def _has_attacking_loss_signal(event: pd.Series) -> bool:
+    event_type = event.get("type")
+    if event_type in {"Miscontrol", "Dispossessed"}:
+        return True
+    if event_type == "Ball Receipt*":
+        return str(event.get("ball_receipt_outcome")) in INCOMPLETE_RECEIPT_OUTCOMES
+    if event_type == "Dribble":
+        return str(event.get("dribble_outcome")) in INCOMPLETE_DRIBBLE_OUTCOMES
+    if event_type == "Pass":
+        return str(event.get("pass_outcome")) in INCOMPLETE_PASS_OUTCOMES
+    if event_type == "Duel":
+        return "Lost" in str(event.get("duel_outcome"))
+    return False
+
+
+def _defensive_candidates(previous_events: pd.DataFrame, transition_team: str) -> pd.DataFrame:
+    candidates = previous_events[
+        (previous_events["team"] == transition_team)
+        & (previous_events["type"].astype("object").isin(DEFENSIVE_PRIORITY))
+        & previous_events["x"].notna()
+        & previous_events["y"].notna()
+    ].copy()
+    if candidates.empty:
+        return candidates
+    candidates["candidate_source"] = "defensive_event"
+    candidates["priority"] = candidates["type"].map(DEFENSIVE_PRIORITY)
+    candidates["valid_candidate"] = candidates.apply(_valid_defensive_event, axis=1)
+    return candidates[candidates["valid_candidate"]].copy()
+
+
+def _attacking_candidates(previous_events: pd.DataFrame, losing_team: str) -> pd.DataFrame:
+    candidates = previous_events[
+        (previous_events["team"] == losing_team)
+        & (previous_events["type"].astype("object").isin(ATTACKING_PRIORITY) | (previous_events["type"] == "Duel"))
+        & previous_events["x"].notna()
+        & previous_events["y"].notna()
+    ].copy()
+    if candidates.empty:
+        return candidates
+    candidates["candidate_source"] = "attacking_event"
+    candidates["priority"] = candidates["type"].map(ATTACKING_PRIORITY).fillna(7)
+    candidates["valid_candidate"] = candidates.apply(_has_attacking_loss_signal, axis=1)
+    return candidates[candidates["valid_candidate"]].copy()
+
+
+def _first_next_possession_recovery(events: pd.DataFrame, next_possession: pd.Series, transition_team: str):
+    mask = (
+        (events["period"] == int(next_possession["period"]))
+        & (events["possession"] == next_possession["possession"])
+    )
+    if "match_id" in events.columns and pd.notna(next_possession.get("match_id", pd.NA)):
+        mask = mask & (events["match_id"] == int(next_possession["match_id"]))
+    next_events = events[mask].sort_values("event_order")
+    if next_events.empty:
+        return None
+    first_event = next_events.iloc[0].copy()
+    if (
+        first_event.get("type") == "Ball Recovery"
+        and first_event.get("team") == transition_team
+        and pd.isna(first_event.get("ball_recovery_recovery_failure"))
+        and pd.notna(first_event.get("x"))
+        and pd.notna(first_event.get("y"))
+    ):
+        return first_event
+    return None
+
+
+def _event_location_for_loss(event: pd.Series):
+    if event.get("type") == "Pass":
+        pass_end = event.get("pass_end_location", None)
+        if _safe_list(pass_end):
+            return float(pass_end[0]), float(pass_end[1])
+    return float(event["x"]), float(event["y"])
+
+
+def _mirror_x(x):
+    return PITCH_LENGTH - float(x) if pd.notna(x) else np.nan
+
+
+def _mirror_y(y):
+    return PITCH_WIDTH - float(y) if pd.notna(y) else np.nan
+
+
+def _choose_turnover_event(events: pd.DataFrame, current_possession: pd.Series, next_possession: pd.Series):
+    losing_team = current_possession["possession_team"]
+    transition_team = next_possession["possession_team"]
+    previous_mask = (
+        (events["period"] == int(current_possession["period"]))
+        & (events["possession"] == current_possession["possession"])
+    )
+    if "match_id" in events.columns and pd.notna(current_possession.get("match_id", pd.NA)):
+        previous_mask = previous_mask & (events["match_id"] == int(current_possession["match_id"]))
+    previous_events = events[previous_mask].copy()
+
+    defensive = _defensive_candidates(previous_events, transition_team)
+    if not defensive.empty:
+        chosen = defensive.sort_values(["priority", "event_order"]).iloc[0].copy()
+        return chosen, "defensive_event", previous_events
+
+    attacking = _attacking_candidates(previous_events, losing_team)
+    recovery = _first_next_possession_recovery(events, next_possession, transition_team)
+    if not attacking.empty and recovery is not None:
+        recovery["candidate_source"] = "next_possession_recovery"
+        recovery["priority"] = 0
+        recovery["valid_candidate"] = True
+        return recovery, "next_possession_recovery", previous_events
+
+    if not attacking.empty:
+        chosen = attacking.sort_values(["event_order", "priority"], ascending=[False, True]).iloc[0].copy()
+        return chosen, "attacking_event", previous_events
+
+    return None, None, previous_events
+
+
+def _normalised_loss_coordinates(event: pd.Series, source: str) -> dict:
+    turnover_x, turnover_y = _event_location_for_loss(event)
+    if source in {"defensive_event", "next_possession_recovery"}:
+        return {
+            "x": _mirror_x(turnover_x),
+            "y": _mirror_y(turnover_y),
+            "transition_x": turnover_x,
+            "transition_y": turnover_y,
+            "turnover_x": turnover_x,
+            "turnover_y": turnover_y,
+        }
+    return {
+        "x": turnover_x,
+        "y": turnover_y,
+        "transition_x": _mirror_x(turnover_x),
+        "transition_y": _mirror_y(turnover_y),
+        "turnover_x": turnover_x,
+        "turnover_y": turnover_y,
+    }
+
+
+def _transition_start_coordinates(
+    events: pd.DataFrame,
+    current_possession: pd.Series,
+    next_possession: pd.Series,
+    turnover_event: pd.Series,
+    source: str,
+):
+    """Coordenadas de inicio de transición (perspectiva del equipo que transiciona)."""
+    coords = _normalised_loss_coordinates(turnover_event, source)
+
+    # En acciones defensivas o recuperación inicial, el turnover ya representa el inicio.
+    if source in {"defensive_event", "next_possession_recovery"}:
+        return (
+            coords["transition_x"],
+            coords["transition_y"],
+            turnover_event.get("type", pd.NA),
+            turnover_event.get("event_seconds", np.nan),
+            "turnover_event",
+        )
+
+    # Si solo hay señal atacante de pérdida, anclamos al primer evento localizable de la posesión B.
+    mask = (
+        (events["period"] == int(next_possession["period"]))
+        & (events["possession"] == next_possession["possession"])
+        & (events["team"] == next_possession["possession_team"])
+    )
+    if "match_id" in events.columns and pd.notna(next_possession.get("match_id", pd.NA)):
+        mask = mask & (events["match_id"] == int(next_possession["match_id"]))
+
+    next_events = events[mask].sort_values("event_order")
+    first_loc = next_events[next_events["x"].notna() & next_events["y"].notna()]
+    if not first_loc.empty:
+        row = first_loc.iloc[0]
+        return (
+            float(row["x"]),
+            float(row["y"]),
+            row.get("type", pd.NA),
+            row.get("event_seconds", np.nan),
+            "next_possession_first_event",
+        )
+
+    # Fallback: turnover espejado en perspectiva del equipo que transiciona.
+    return (
+        coords["transition_x"],
+        coords["transition_y"],
+        turnover_event.get("type", pd.NA),
+        turnover_event.get("event_seconds", np.nan),
+        "mirrored_turnover_event",
+    )
+
+
 def _build_transition_starts(
     events: pd.DataFrame,
     team_set: frozenset,
@@ -311,57 +569,66 @@ def _build_transition_starts(
 ) -> pd.DataFrame:
     _COLS = ["match_id","period","team","x","y","start_type","transition_possession",
              "transition_play_pattern","danger_shot","danger_box_entry","danger_from_counter",
-             "dangerous_action","ends_in_shot","ends_in_goal"]
-
-    ev = events[events["team"].isin(team_set)].copy()
-    if ev.empty:
-        return pd.DataFrame(columns=_COLS)
+             "dangerous_action","ends_in_shot","ends_in_goal","previous_play_pattern",
+             "turnover_event_source","start_context_source"]
 
     meta = _possession_meta(events)
     if meta.empty:
         return pd.DataFrame(columns=_COLS)
 
-    mask_recovery = (ev["type"] == "Ball Recovery") & (ev["ball_recovery_recovery_failure"].isna())
-    mask_interception = (
-        (ev["type"] == "Interception")
-        & (ev["interception_outcome"].astype("object").isin(TRANSITION_RECOVERY_SUCCESS)
-           | ev["interception_outcome"].isna())
-    )
-    mask_tackle = (
-        (ev["type"] == "Duel") & (ev["duel_type"] == "Tackle")
-        & (ev["duel_outcome"].astype("object").isin(TACKLE_SUCCESS))
-    )
-    starts = ev[mask_recovery | mask_interception | mask_tackle].dropna(subset=["x", "y"]).copy()
-    if starts.empty:
+    possession_pairs = _add_next_possession_columns(meta)
+    if possession_pairs.empty:
         return pd.DataFrame(columns=_COLS)
 
     rows = []
-    for _, row in starts.iterrows():
-        match_id = int(row["match_id"])
-        period   = int(row["period"])
-        team     = row["team"]
+    for _, pair in possession_pairs.iterrows():
+        current_poss, next_poss = _pair_to_possession_series(pair)
+        transition_team = next_poss["possession_team"]   # B
+        losing_team = current_poss["possession_team"]    # A
 
-        if row.get("possession_team") == row.get("team"):
-            transition_possession = row.get("possession")
-            transition_pattern    = row.get("play_pattern")
-        else:
-            transition_possession, transition_pattern = _next_possession_for_team(
-                meta, match_id, period, float(row["event_order"]), team
-            )
+        if transition_team not in team_set:
+            continue
+        if transition_team == losing_team:
+            continue
 
-        if pd.isna(transition_possession):
+        # Estándar: la jugada B solo puede ser open play o contraataque.
+        transition_pattern = next_poss["play_pattern"]
+        if transition_pattern not in OPEN_PLAY_NEXT_PATTERNS:
             continue
-        if pattern_set and transition_pattern not in pattern_set:
+
+        # El selector de patrón en transiciones filtra la jugada A.
+        previous_pattern = current_poss["play_pattern"]
+        if pattern_set and previous_pattern not in pattern_set:
             continue
+
+        turnover_event, source, previous_events = _choose_turnover_event(events, current_poss, next_poss)
+        if turnover_event is None:
+            continue
+        if _is_restart_or_out(previous_events, next_poss):
+            continue
+
+        x, y, start_type, start_seconds, start_context = _transition_start_coordinates(
+            events=events,
+            current_possession=current_poss,
+            next_possession=next_poss,
+            turnover_event=turnover_event,
+            source=source,
+        )
+        if pd.isna(x) or pd.isna(y):
+            continue
+
+        match_id = int(next_poss["match_id"])
+        period = int(next_poss["period"])
+        transition_possession = next_poss["possession"]
 
         target_events = events[
             (events["match_id"] == match_id)
             & (events["period"] == period)
             & (events["possession"] == transition_possession)
-            & (events["team"] == team)
+            & (events["team"] == transition_team)
         ].copy()
         target_events = _target_events_by_scope(
-            target_events, row.get("event_seconds", np.nan), danger_scope, danger_window
+            target_events, start_seconds, danger_scope, danger_window
         )
         flags     = _danger_flags_for_target(target_events, transition_pattern)
         dangerous = _combine_danger_flags(flags, danger_criteria, danger_combine)
@@ -372,10 +639,10 @@ def _build_transition_starts(
         rows.append({
             "match_id":               match_id,
             "period":                 period,
-            "team":                   team,
-            "x":                      float(row["x"]),
-            "y":                      float(row["y"]),
-            "start_type":             row["type"],
+            "team":                   transition_team,
+            "x":                      float(x),
+            "y":                      float(y),
+            "start_type":             start_type,
             "transition_possession":  transition_possession,
             "transition_play_pattern":transition_pattern,
             "danger_shot":            flags["danger_shot"],
@@ -384,6 +651,9 @@ def _build_transition_starts(
             "dangerous_action":       dangerous,
             "ends_in_shot":           flags["danger_shot"],
             "ends_in_goal":           ends_in_goal,
+            "previous_play_pattern":  previous_pattern,
+            "turnover_event_source":  source,
+            "start_context_source":   start_context,
         })
 
     if not rows:
@@ -403,48 +673,41 @@ def _build_loss_events(
 ) -> pd.DataFrame:
     _COLS = ["match_id","period","team","opponent","possession","next_opponent_possession",
              "play_pattern","action_type","x","y","danger_shot","danger_box_entry",
-             "danger_from_counter","dangerous_loss","opponent_shot","opponent_box_entry","opponent_counter"]
+             "danger_from_counter","dangerous_loss","opponent_shot","opponent_box_entry","opponent_counter",
+             "transition_play_pattern","turnover_event_source","turnover_event_id","turnover_event_team",
+             "turnover_event_order","turnover_event_seconds","turnover_x","turnover_y",
+             "transition_x","transition_y","target_start_seconds"]
 
     meta = _possession_meta(events)
     if meta.empty:
         return pd.DataFrame(columns=_COLS)
 
-    own_possessions = meta[meta["possession_team"].isin(team_set)].copy()
-    if filter_losses_by_pattern and pattern_set:
-        own_possessions = own_possessions[own_possessions["play_pattern"].isin(pattern_set)]
-    if own_possessions.empty:
+    possession_pairs = _add_next_possession_columns(meta)
+    if possession_pairs.empty:
         return pd.DataFrame(columns=_COLS)
 
     rows = []
-    for _, poss in own_possessions.iterrows():
-        match_id     = int(poss["match_id"])
-        team         = poss["possession_team"]
-        period       = int(poss["period"])
-        possession_id = poss["possession"]
+    for _, pair in possession_pairs.iterrows():
+        current_poss, next_poss = _pair_to_possession_series(pair)
+        match_id = int(current_poss["match_id"])
+        period = int(current_poss["period"])
+        team = current_poss["possession_team"]
+        opponent = next_poss["possession_team"]
 
-        possession_events = events[
-            (events["match_id"] == match_id)
-            & (events["period"] == period)
-            & (events["possession"] == possession_id)
-            & (events["team"] == team)
-        ].copy()
-
-        candidates = possession_events[
-            possession_events["type"].astype("object").isin(LOSS_CANDIDATE_TYPES)
-            & possession_events["x"].notna()
-            & possession_events["y"].notna()
-        ].copy()
-        if candidates.empty:
+        if team not in team_set:
+            continue
+        if team == opponent:
+            continue
+        if filter_losses_by_pattern and pattern_set and current_poss["play_pattern"] not in pattern_set:
             continue
 
-        loss_event = candidates.sort_values("event_order").iloc[-1]
-        next_poss  = _next_opponent_possession(
-            meta, match_id, period, float(loss_event["event_order"]), team
-        )
-        if next_poss is None:
+        loss_event, source, previous_events = _choose_turnover_event(events, current_poss, next_poss)
+        if loss_event is None:
+            continue
+        if _is_restart_or_out(previous_events, next_poss):
             continue
 
-        opponent    = next_poss["possession_team"]
+        coords = _normalised_loss_coordinates(loss_event, source)
         next_events = events[
             (events["match_id"] == match_id)
             & (events["period"] == period)
@@ -453,7 +716,7 @@ def _build_loss_events(
         ].copy()
 
         target_events = _target_events_by_scope(
-            next_events, loss_event.get("event_seconds", np.nan), danger_scope, danger_window
+            next_events, next_poss.get("start_seconds", np.nan), danger_scope, danger_window
         )
         flags     = _danger_flags_for_target(target_events, next_poss["play_pattern"])
         dangerous = _combine_danger_flags(flags, danger_criteria, danger_combine)
@@ -463,12 +726,12 @@ def _build_loss_events(
             "period":                  period,
             "team":                    team,
             "opponent":                opponent,
-            "possession":              possession_id,
+            "possession":              current_poss["possession"],
             "next_opponent_possession":next_poss["possession"],
-            "play_pattern":            poss["play_pattern"],
+            "play_pattern":            current_poss["play_pattern"],
             "action_type":             loss_event["type"],
-            "x":                       float(loss_event["x"]),
-            "y":                       float(loss_event["y"]),
+            "x":                       coords["x"],
+            "y":                       coords["y"],
             "danger_shot":             flags["danger_shot"],
             "danger_box_entry":        flags["danger_box_entry"],
             "danger_from_counter":     flags["danger_from_counter"],
@@ -476,11 +739,24 @@ def _build_loss_events(
             "opponent_shot":           flags["danger_shot"],
             "opponent_box_entry":      flags["danger_box_entry"],
             "opponent_counter":        flags["danger_from_counter"],
+            "transition_play_pattern":  next_poss["play_pattern"],
+            "turnover_event_source":    source,
+            "turnover_event_id":        loss_event.get("id", pd.NA),
+            "turnover_event_team":      loss_event.get("team", pd.NA),
+            "turnover_event_order":     float(loss_event["event_order"]) if pd.notna(loss_event.get("event_order", np.nan)) else np.nan,
+            "turnover_event_seconds":   float(loss_event["event_seconds"]) if pd.notna(loss_event.get("event_seconds", np.nan)) else np.nan,
+            "turnover_x":               coords["turnover_x"],
+            "turnover_y":               coords["turnover_y"],
+            "transition_x":             coords["transition_x"],
+            "transition_y":             coords["transition_y"],
+            "target_start_seconds":     float(next_poss["start_seconds"]) if pd.notna(next_poss.get("start_seconds", np.nan)) else np.nan,
         })
 
     if not rows:
         return pd.DataFrame(columns=_COLS)
     return pd.DataFrame(rows)
+
+
 def _process_single_match(
     match_id: int,
     team_set: frozenset,
